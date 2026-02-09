@@ -18,6 +18,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.kv_store import OmniKvStoreFactory
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -67,6 +68,36 @@ class OmniARScheduler(VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+
+        # [Omni] KV store backend for CPU offloading
+        self.kv_store_backend = self._create_kv_store_backend()
+        self.offloaded_requests: set[str] = set()
+
+    def _create_kv_store_backend(self):
+        """Create KV store backend from omni_kv_config.kv_store_config."""
+        omni_kv_config = getattr(self.vllm_config.model_config, "omni_kv_config", None)
+        if not omni_kv_config:
+            return None
+
+        kv_store_config = (
+            omni_kv_config.get("kv_store_config", None)
+            if isinstance(omni_kv_config, dict)
+            else getattr(omni_kv_config, "kv_store_config", None)
+        )
+        if not kv_store_config or not kv_store_config.get("enable_offload"):
+            return None
+
+        try:
+            backend = OmniKvStoreFactory.create("x", kv_store_config)
+            if backend:
+                logger.info(
+                    "[Omni] KV store backend enabled: %s",
+                    backend,
+                )
+            return backend
+        except Exception as e:
+            logger.warning("[Omni] Failed to create KV store backend: %s", e)
+            return None
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -177,18 +208,68 @@ class OmniARScheduler(VLLMScheduler):
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
             # Add information about requests needing KV cache transfer
             finished_reqs = self.get_finished_requests_needing_kv_transfer()
+
+            # [Omni] Generate KV offload/prefetch decisions
+            kv_offload_decisions = None
+            if self.kv_store_backend is not None:
+                kv_offload_decisions = self._generate_offload_decisions(scheduler_output)
         except Exception:
             # If anything goes wrong, leave the original output unchanged
             init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
             finished_reqs = {}
+            kv_offload_decisions = None
 
         # Wrap in omni scheduler output to carry transfer metadata.
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
-        return OmniSchedulerOutput(
+        omni_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        omni_output.kv_offload_decisions = kv_offload_decisions
+        return omni_output
+
+    def _generate_offload_decisions(self, scheduler_output: SchedulerOutput) -> dict[str, list[str]]:
+        """Generate offload/prefetch decisions after scheduling.
+
+        Returns:
+            {"offload_req_ids": [...], "prefetch_req_ids": [...]}
+        """
+        offload_ids: list[str] = []
+        prefetch_ids: list[str] = []
+
+        scheduled = set(scheduler_output.num_scheduled_tokens.keys())
+
+        # Prefetch: offloaded requests that are now scheduled
+        for req_id in list(self.offloaded_requests):
+            if req_id in scheduled:
+                prefetch_ids.append(req_id)
+                self.offloaded_requests.discard(req_id)
+
+        # Offload: running requests NOT scheduled this step (idle)
+        # Only offload when there are waiting requests (memory pressure)
+        if self.waiting.qsize() > 0:
+            for req in self.running:
+                req_id = req.request_id
+                if (
+                    req_id not in scheduled
+                    and req_id not in self.offloaded_requests
+                    and req_id not in self.waiting_for_transfer_free
+                ):
+                    offload_ids.append(req_id)
+                    self.offloaded_requests.add(req_id)
+
+        if offload_ids or prefetch_ids:
+            logger.debug(
+                "[Omni] KV offload decisions: offload=%s, prefetch=%s",
+                offload_ids,
+                prefetch_ids,
+            )
+
+        return {
+            "offload_req_ids": offload_ids,
+            "prefetch_req_ids": prefetch_ids,
+        }
 
     def update_from_output(
         self,

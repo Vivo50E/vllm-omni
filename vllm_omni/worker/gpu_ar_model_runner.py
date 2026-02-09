@@ -33,6 +33,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
+from vllm_omni.core.kv_store import OmniKvStoreFactory
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -74,6 +75,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
 
+        # [Omni] KV store backend for CPU offloading
+        self.kv_store_backend = self._create_kv_store_backend()
+
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
         from vllm_omni.distributed.ray_utils.utils import (
@@ -104,6 +108,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
             cache_dtype=str(self.cache_config.cache_dtype),
             request_id_resolver=self._resolve_global_request_id,
         )
+
+        # [Omni] Execute KV offload/prefetch decisions
+        self._execute_kv_offload_decisions(scheduler_output)
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -607,3 +614,95 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 return global_id.decode("utf-8")
             return str(global_id)
         return req_id
+
+    # =================================================================
+    # KV store offloading helpers
+    # =================================================================
+
+    def _create_kv_store_backend(self):
+        """Create KV store backend from model config."""
+        omni_kv_config = getattr(self.vllm_config.model_config, "omni_kv_config", None)
+        if not omni_kv_config:
+            return None
+        kv_store_config = (
+            omni_kv_config.get("kv_store_config", None)
+            if isinstance(omni_kv_config, dict)
+            else getattr(omni_kv_config, "kv_store_config", None)
+        )
+        if not kv_store_config or not kv_store_config.get("enable_offload"):
+            return None
+        try:
+            return OmniKvStoreFactory.create("x", kv_store_config)
+        except Exception as e:
+            logger.warning("[Omni] KV store backend init failed: %s", e)
+            return None
+
+    def _execute_kv_offload_decisions(self, scheduler_output: SchedulerOutput) -> None:
+        """Execute offload/prefetch decisions from scheduler."""
+        if self.kv_store_backend is None:
+            return
+
+        decisions = getattr(scheduler_output, "kv_offload_decisions", None)
+        if not decisions:
+            return
+
+        block_size = self.cache_config.block_size
+
+        # --- Prefetch first (load KV back to GPU before forward) ---
+        for req_id in decisions.get("prefetch_req_ids", []):
+            try:
+                kv_data = self.kv_store_backend.load_kv(req_id, target_device=str(self.device))
+                if kv_data:
+                    self._inject_request_kv(req_id, kv_data, block_size)
+                    logger.debug("[Omni] Prefetched KV for '%s'", req_id)
+            except Exception as e:
+                logger.error("[Omni] Prefetch failed for '%s': %s", req_id, e)
+
+        # --- Then offload (save KV to backend) ---
+        for req_id in decisions.get("offload_req_ids", []):
+            try:
+                kv_data = self._extract_request_kv(req_id, block_size)
+                if kv_data:
+                    self.kv_store_backend.store_kv(req_id, kv_data)
+                    logger.debug("[Omni] Offloaded KV for '%s'", req_id)
+            except Exception as e:
+                logger.error("[Omni] Offload failed for '%s': %s", req_id, e)
+
+    def _extract_request_kv(self, req_id: str, block_size: int) -> dict | None:
+        """Extract KV cache tensors for a request from GPU."""
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return None
+
+        block_ids = req_state.block_ids[0] if req_state.block_ids else []
+        if not block_ids:
+            return None
+
+        seq_len = req_state.num_computed_tokens
+        kv_caches_cpu = []
+        for layer_kv in self.kv_caches:
+            # layer_kv shape: [2, num_blocks, block_size, n_heads, head_dim]
+            selected = layer_kv[:, block_ids].detach().cpu().contiguous()
+            kv_caches_cpu.append(selected)
+
+        return {
+            "kv_caches": kv_caches_cpu,
+            "block_ids": list(block_ids),
+            "seq_len": seq_len,
+        }
+
+    def _inject_request_kv(self, req_id: str, kv_data: dict, block_size: int) -> None:
+        """Inject KV cache tensors back into GPU for a request."""
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return
+
+        block_ids = kv_data.get("block_ids")
+        if not block_ids:
+            return
+
+        kv_caches = kv_data["kv_caches"]
+        for layer_idx, layer_kv in enumerate(self.kv_caches):
+            if layer_idx < len(kv_caches):
+                src = kv_caches[layer_idx].to(self.device)
+                layer_kv[:, block_ids] = src
