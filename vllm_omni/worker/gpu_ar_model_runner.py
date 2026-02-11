@@ -109,9 +109,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
             request_id_resolver=self._resolve_global_request_id,
         )
 
-        # [Omni] Execute KV offload/prefetch decisions
-        self._execute_kv_offload_decisions(scheduler_output)
-
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -129,6 +126,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+
+            # [Omni] Execute KV offload/prefetch after _update_states
+            # (prefetch needs new block IDs from newly scheduled requests)
+            self._execute_kv_offload_decisions(scheduler_output)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -638,7 +639,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
             return None
 
     def _execute_kv_offload_decisions(self, scheduler_output: SchedulerOutput) -> None:
-        """Execute offload/prefetch decisions from scheduler."""
+        """Execute KV save/load decisions from scheduler (KVConnector pattern).
+
+        Save: copy KV to CPU for all running decode requests (pure backup,
+              blocks stay on GPU, request keeps running).
+        Load: when a preempted request with CPU backup gets re-scheduled,
+              load KV from CPU into newly allocated GPU blocks.
+
+        Called AFTER _update_states so resumed requests have new block IDs.
+        """
         if self.kv_store_backend is None:
             return
 
@@ -647,29 +656,43 @@ class GPUARModelRunner(OmniGPUModelRunner):
             return
 
         block_size = self.cache_config.block_size
+        load_new_block_ids = decisions.get("load_new_block_ids", {})
 
-        # --- Prefetch first (load KV back to GPU before forward) ---
-        for req_id in decisions.get("prefetch_req_ids", []):
+        # --- Load first (restore KV into new blocks before forward) ---
+        for req_id in decisions.get("load_req_ids", []):
             try:
                 kv_data = self.kv_store_backend.load_kv(req_id, target_device=str(self.device))
                 if kv_data:
-                    self._inject_request_kv(req_id, kv_data, block_size)
-                    logger.debug("[Omni] Prefetched KV for '%s'", req_id)
+                    new_block_ids = load_new_block_ids.get(req_id)
+                    if not new_block_ids:
+                        req_state = self.requests.get(req_id)
+                        if req_state and req_state.block_ids:
+                            new_block_ids = list(req_state.block_ids[0])
+                    self._load_request_kv(req_id, kv_data, block_size, new_block_ids)
+                    self.kv_store_backend.evict_kv(req_id)
+                    logger.info(
+                        "[Omni] Loaded KV for '%s' into blocks %s...",
+                        req_id,
+                        new_block_ids[:4] if new_block_ids else [],
+                    )
             except Exception as e:
-                logger.error("[Omni] Prefetch failed for '%s': %s", req_id, e)
+                logger.error("[Omni] KV load failed for '%s': %s", req_id, e)
 
-        # --- Then offload (save KV to backend) ---
-        for req_id in decisions.get("offload_req_ids", []):
+        # --- Then save (backup KV to CPU, no block release, no scheduler feedback) ---
+        for req_id in decisions.get("save_req_ids", []):
             try:
-                kv_data = self._extract_request_kv(req_id, block_size)
-                if kv_data:
-                    self.kv_store_backend.store_kv(req_id, kv_data)
-                    logger.debug("[Omni] Offloaded KV for '%s'", req_id)
+                kv_data = self._save_request_kv(req_id, block_size)
+                if kv_data and not self.kv_store_backend.store_kv(req_id, kv_data):
+                    logger.warning("[Omni] KV store full, skipping save for '%s'", req_id)
             except Exception as e:
-                logger.error("[Omni] Offload failed for '%s': %s", req_id, e)
+                logger.error("[Omni] KV save failed for '%s': %s", req_id, e)
 
-    def _extract_request_kv(self, req_id: str, block_size: int) -> dict | None:
-        """Extract KV cache tensors for a request from GPU."""
+    def _save_request_kv(self, req_id: str, block_size: int) -> dict | None:
+        """Save KV cache tensors for a request from GPU to CPU (swap-out).
+
+        Follows vLLM KVConnector convention: save_kv extracts GPU tensors
+        for the given request's blocks and returns a CPU-resident dict.
+        """
         req_state = self.requests.get(req_id)
         if req_state is None:
             return None
@@ -691,18 +714,36 @@ class GPUARModelRunner(OmniGPUModelRunner):
             "seq_len": seq_len,
         }
 
-    def _inject_request_kv(self, req_id: str, kv_data: dict, block_size: int) -> None:
-        """Inject KV cache tensors back into GPU for a request."""
-        req_state = self.requests.get(req_id)
-        if req_state is None:
+    def _load_request_kv(
+        self, req_id: str, kv_data: dict, block_size: int, new_block_ids: list[int] | None = None
+    ) -> None:
+        """Load KV cache tensors from CPU back into GPU blocks (swap-in).
+
+        Follows vLLM KVConnector convention: load_kv writes CPU tensors
+        into the target GPU blocks.
+
+        Args:
+            new_block_ids: If provided, use these (newly allocated) block IDs
+                instead of the old ones stored in kv_data.  The saved tensors
+                are mapped positionally: saved_block[0] -> new_block_ids[0].
+        """
+        seq_len = kv_data.get("seq_len", 0)
+        old_block_ids = kv_data.get("block_ids", [])
+        target_ids = new_block_ids if new_block_ids else old_block_ids
+        if not target_ids:
             return
 
-        block_ids = kv_data.get("block_ids")
-        if not block_ids:
-            return
+        # Only load blocks that contain actual data
+        num_data_blocks = min(
+            (seq_len + block_size - 1) // block_size if seq_len > 0 else len(old_block_ids),
+            len(old_block_ids),
+            len(target_ids),
+        )
+        target_ids = target_ids[:num_data_blocks]
 
         kv_caches = kv_data["kv_caches"]
         for layer_idx, layer_kv in enumerate(self.kv_caches):
             if layer_idx < len(kv_caches):
                 src = kv_caches[layer_idx].to(self.device)
-                layer_kv[:, block_ids] = src
+                # Positional mapping: src[:, i] -> layer_kv[:, target_ids[i]]
+                layer_kv[:, target_ids] = src[:, :num_data_blocks]

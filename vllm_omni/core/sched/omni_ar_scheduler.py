@@ -71,7 +71,19 @@ class OmniARScheduler(VLLMScheduler):
 
         # [Omni] KV store backend for CPU offloading
         self.kv_store_backend = self._create_kv_store_backend()
-        self.offloaded_requests: set[str] = set()
+        self.offloaded_requests: set[str] = set()  # KV on CPU, request in waiting queue
+        self.offloaded_metadata: dict[str, dict] = {}  # {req_id: {"seq_len": int}}
+
+    def _get_offload_config(self, key: str, default: Any = None) -> Any:
+        omni_kv_config = getattr(self.vllm_config.model_config, "omni_kv_config", None)
+        if not omni_kv_config:
+            return default
+        kv_store_config = (
+            omni_kv_config.get("kv_store_config", {})
+            if isinstance(omni_kv_config, dict)
+            else getattr(omni_kv_config, "kv_store_config", {}) or {}
+        )
+        return kv_store_config.get(key, default) if isinstance(kv_store_config, dict) else default
 
     def _create_kv_store_backend(self):
         """Create KV store backend from omni_kv_config.kv_store_config."""
@@ -225,51 +237,98 @@ class OmniARScheduler(VLLMScheduler):
         omni_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
+            kv_offload_decisions=kv_offload_decisions,
         )
-        omni_output.kv_offload_decisions = kv_offload_decisions
         return omni_output
 
-    def _generate_offload_decisions(self, scheduler_output: SchedulerOutput) -> dict[str, list[str]]:
-        """Generate offload/prefetch decisions after scheduling.
+    def _generate_offload_decisions(self, scheduler_output: SchedulerOutput) -> dict[str, Any]:
+        """Generate save/load decisions following KVConnector convention.
+
+        Save: unconditionally copy KV to CPU for all running decode requests
+        every step (pure backup, blocks stay on GPU, request keeps running).
+        Load: when a preempted request with CPU backup gets re-scheduled,
+        load KV into new blocks instead of recomputing.
 
         Returns:
-            {"offload_req_ids": [...], "prefetch_req_ids": [...]}
+            {"save_req_ids": [...], "load_req_ids": [...],
+             "load_new_block_ids": {req_id: list[int]}}
         """
-        offload_ids: list[str] = []
-        prefetch_ids: list[str] = []
+        save_ids: list[str] = []
+        load_ids: list[str] = []
+        load_new_block_ids: dict[str, list[int]] = {}
 
         scheduled = set(scheduler_output.num_scheduled_tokens.keys())
 
-        # Prefetch: offloaded requests that are now scheduled
+        # --- Load: preempted requests with CPU backup that got re-scheduled ---
         for req_id in list(self.offloaded_requests):
             if req_id in scheduled:
-                prefetch_ids.append(req_id)
+                load_ids.append(req_id)
+                try:
+                    block_ids_tuple = self.kv_cache_manager.get_block_ids(req_id)
+                    if block_ids_tuple:
+                        load_new_block_ids[req_id] = list(block_ids_tuple[0])
+                except Exception:
+                    logger.warning("[Omni] Failed to get new block IDs for load of %s", req_id)
                 self.offloaded_requests.discard(req_id)
+                self.offloaded_metadata.pop(req_id, None)
 
-        # Offload: running requests NOT scheduled this step (idle)
-        # Only offload when there are waiting requests (memory pressure)
-        if self.waiting.qsize() > 0:
-            for req in self.running:
-                req_id = req.request_id
-                if (
-                    req_id not in scheduled
-                    and req_id not in self.offloaded_requests
-                    and req_id not in self.waiting_for_transfer_free
-                ):
-                    offload_ids.append(req_id)
-                    self.offloaded_requests.add(req_id)
+        # --- Save: unconditional for all running decode requests ---
+        for req in self.running:
+            rid = req.request_id
+            if (
+                rid in scheduled
+                and rid not in self.waiting_for_transfer_free
+                and req.num_computed_tokens > req.num_prompt_tokens
+            ):
+                save_ids.append(rid)
 
-        if offload_ids or prefetch_ids:
+        if save_ids or load_ids:
             logger.debug(
-                "[Omni] KV offload decisions: offload=%s, prefetch=%s",
-                offload_ids,
-                prefetch_ids,
+                "[Omni] KV decisions: save=%d reqs, load=%s",
+                len(save_ids),
+                load_ids,
             )
 
         return {
-            "offload_req_ids": offload_ids,
-            "prefetch_req_ids": prefetch_ids,
+            "save_req_ids": save_ids,
+            "load_req_ids": load_ids,
+            "load_new_block_ids": load_new_block_ids,
         }
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Override preemption to preserve num_computed_tokens when CPU backup exists.
+
+        Standard preemption (base class) resets num_computed_tokens=0, forcing
+        full recomputation.  If KV is backed up on CPU, we preserve
+        num_computed_tokens (minus 1) so the KVTransfer path (scheduler.py:629)
+        kicks in on resume — base scheduler allocates new blocks and schedules
+        only 1 new token instead of full prefill.
+        """
+        req_id = request.request_id
+        has_backup = (
+            self.kv_store_backend is not None and self.kv_store_backend.load_kv(req_id, target_device="cpu") is not None
+        )
+
+        if has_backup:
+            seq_len = request.num_computed_tokens
+            # Do block free + status change like base, but preserve num_computed_tokens
+            self.kv_cache_manager.free(request)
+            self.encoder_cache_manager.free(request)
+            request.status = RequestStatus.PREEMPTED
+            request.num_computed_tokens = max(seq_len - 1, 0)
+            request.spec_token_ids.clear()
+            request.num_preemptions += 1
+            self.waiting.prepend_request(request)
+            self.offloaded_requests.add(req_id)
+            self.offloaded_metadata[req_id] = {"seq_len": seq_len}
+            logger.info(
+                "[Omni] Preempted %s with CPU backup: preserved %d computed tokens",
+                req_id,
+                request.num_computed_tokens,
+            )
+        else:
+            # No backup — fall back to standard preemption (recompute from scratch)
+            super()._preempt_request(request, timestamp)
 
     def update_from_output(
         self,
@@ -527,32 +586,27 @@ class OmniARScheduler(VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        # This is where we free blocks that were held for transfer
+        # Process extraction acks from runner (inter-stage KV transfers)
         try:
             kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
             if kv_extracted_ids:
                 for req_id in kv_extracted_ids:
-                    # Mark transfer as finished
                     if req_id in self.active_kv_transfers:
                         self.active_kv_transfers.remove(req_id)
-                        logger.debug(f"[Omni] KV Transfer finished for {req_id}")
+                        logger.debug("[Omni] KV Transfer finished for %s", req_id)
 
                     if req_id in self.waiting_for_transfer_free:
-                        # Now it's safe to free blocks
                         req = self.requests.get(req_id)
                         if req:
                             self.kv_cache_manager.free(req)
                             if req_id in self.requests:
                                 del self.requests[req_id]
-                            if req_id in self.transfer_triggered_requests:
-                                self.transfer_triggered_requests.remove(req_id)
-                            if req_id in self.active_kv_transfers:
-                                self.active_kv_transfers.remove(req_id)
-
-                            logger.debug(f"Freed blocks for {req_id} after transfer extraction")
+                            self.transfer_triggered_requests.discard(req_id)
+                            self.active_kv_transfers.discard(req_id)
+                            logger.debug("Freed blocks for %s after transfer extraction", req_id)
                         self.waiting_for_transfer_free.remove(req_id)
         except Exception:
-            init_logger(__name__).exception("Failed to process finished transfer requests")
+            init_logger(__name__).exception("Failed to process extraction acks")
 
         return engine_core_outputs
 
