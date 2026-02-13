@@ -109,6 +109,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
             request_id_resolver=self._resolve_global_request_id,
         )
 
+        # [Omni] Offload Phase A: extract KV to CPU BEFORE _update_states
+        # (needs old block IDs that are still valid on GPU)
+        self._execute_offload_extract(scheduler_output)
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -127,9 +131,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # Update persistent batch states.
             self._update_states(scheduler_output)
 
-            # [Omni] Execute KV offload/prefetch after _update_states
-            # (prefetch needs new block IDs from newly scheduled requests)
-            self._execute_kv_offload_decisions(scheduler_output)
+            # [Omni] Offload Phase B: load KV from CPU AFTER _update_states
+            # (needs new block IDs from newly scheduled/resumed requests)
+            self._execute_offload_load(scheduler_output)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -638,13 +642,38 @@ class GPUARModelRunner(OmniGPUModelRunner):
             logger.warning("[Omni] KV store backend init failed: %s", e)
             return None
 
-    def _execute_kv_offload_decisions(self, scheduler_output: SchedulerOutput) -> None:
-        """Execute KV save/load decisions from scheduler (KVConnector pattern).
+    def _execute_offload_extract(self, scheduler_output: SchedulerOutput) -> None:
+        """Phase A: Extract KV from GPU to CPU for offload candidates.
 
-        Save: copy KV to CPU for all running decode requests (pure backup,
-              blocks stay on GPU, request keeps running).
-        Load: when a preempted request with CPU backup gets re-scheduled,
-              load KV from CPU into newly allocated GPU blocks.
+        Called BEFORE _update_states so we can read the current (old) block IDs.
+        Successfully extracted req_ids are appended to self.kv_extracted_req_ids
+        to flow back to the scheduler as acknowledgments.
+        """
+        if self.kv_store_backend is None:
+            return
+
+        decisions = getattr(scheduler_output, "kv_offload_decisions", None)
+        if not decisions:
+            return
+
+        offload_req_ids = decisions.get("offload_req_ids", [])
+        if not offload_req_ids:
+            return
+
+        block_size = self.cache_config.block_size
+        for req_id in offload_req_ids:
+            try:
+                kv_data = self._save_request_kv(req_id, block_size)
+                if kv_data and self.kv_store_backend.store_kv(req_id, kv_data):
+                    self.kv_extracted_req_ids.append(req_id)
+                    logger.info("[Omni] Offload extract: saved KV for '%s' to CPU", req_id)
+                elif kv_data:
+                    logger.warning("[Omni] CPU store full, skipping offload for '%s'", req_id)
+            except Exception as e:
+                logger.error("[Omni] Offload extract failed for '%s': %s", req_id, e)
+
+    def _execute_offload_load(self, scheduler_output: SchedulerOutput) -> None:
+        """Phase B: Load KV from CPU into newly allocated GPU blocks.
 
         Called AFTER _update_states so resumed requests have new block IDs.
         """
@@ -655,11 +684,14 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if not decisions:
             return
 
+        load_req_ids = decisions.get("load_req_ids", [])
+        if not load_req_ids:
+            return
+
         block_size = self.cache_config.block_size
         load_new_block_ids = decisions.get("load_new_block_ids", {})
 
-        # --- Load first (restore KV into new blocks before forward) ---
-        for req_id in decisions.get("load_req_ids", []):
+        for req_id in load_req_ids:
             try:
                 kv_data = self.kv_store_backend.load_kv(req_id, target_device=str(self.device))
                 if kv_data:
@@ -677,15 +709,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     )
             except Exception as e:
                 logger.error("[Omni] KV load failed for '%s': %s", req_id, e)
-
-        # --- Then save (backup KV to CPU, no block release, no scheduler feedback) ---
-        for req_id in decisions.get("save_req_ids", []):
-            try:
-                kv_data = self._save_request_kv(req_id, block_size)
-                if kv_data and not self.kv_store_backend.store_kv(req_id, kv_data):
-                    logger.warning("[Omni] KV store full, skipping save for '%s'", req_id)
-            except Exception as e:
-                logger.error("[Omni] KV save failed for '%s': %s", req_id, e)
 
     def _save_request_kv(self, req_id: str, block_size: int) -> dict | None:
         """Save KV cache tensors for a request from GPU to CPU (swap-out).

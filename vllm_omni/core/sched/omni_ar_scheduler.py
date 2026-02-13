@@ -74,6 +74,12 @@ class OmniARScheduler(VLLMScheduler):
         self.offloaded_requests: set[str] = set()  # KV on CPU, request in waiting queue
         self.offloaded_metadata: dict[str, dict] = {}  # {req_id: {"seq_len": int}}
 
+        # [Omni] Two-phase offload protocol state
+        self.offload_pending_extract: set[str] = set()  # Phase 1: waiting for runner extraction
+        self.offload_pending_free: set[str] = set()  # Phase 2: extraction done, pending block free
+        self.offload_usage_threshold: float = self._get_offload_config("offload_usage_threshold", 0.85)
+        self.max_offloads_per_step: int = self._get_offload_config("max_offloads_per_step", 2)
+
     def _get_offload_config(self, key: str, default: Any = None) -> Any:
         omni_kv_config = getattr(self.vllm_config.model_config, "omni_kv_config", None)
         if not omni_kv_config:
@@ -178,6 +184,46 @@ class OmniARScheduler(VLLMScheduler):
 
         return False
 
+    def _execute_pending_frees(self) -> None:
+        """Phase 2 of two-phase offload: free GPU blocks for extracted requests.
+
+        Called at the start of schedule(), BEFORE super().schedule(), so that
+        freed blocks are available for new/waiting requests in the same cycle.
+        """
+        if not self.offload_pending_free:
+            return
+
+        for req_id in list(self.offload_pending_free):
+            request = self.requests.get(req_id)
+            if request is None:
+                # Request already finished/aborted
+                self.offload_pending_free.discard(req_id)
+                continue
+
+            seq_len = request.num_computed_tokens
+            # Free GPU blocks
+            self.kv_cache_manager.free(request)
+            self.encoder_cache_manager.free(request)
+            # Preserve num_computed_tokens so resume path allocates all blocks
+            # but only schedules 1 new token (not full recompute)
+            request.status = RequestStatus.PREEMPTED
+            request.num_computed_tokens = max(seq_len - 1, 0)
+            request.spec_token_ids.clear()
+            request.num_preemptions += 1
+            # Remove from running and prepend to waiting
+            self.running = remove_all(self.running, {request})
+            self.waiting.prepend_request(request)
+            # Track as offloaded
+            self.offloaded_requests.add(req_id)
+            self.offloaded_metadata[req_id] = {"seq_len": seq_len}
+            logger.info(
+                "[Omni] Offload Phase 2: freed blocks for %s, preserved %d computed tokens",
+                req_id,
+                request.num_computed_tokens,
+            )
+
+        self.offload_pending_free.clear()
+
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
@@ -224,6 +270,18 @@ class OmniARScheduler(VLLMScheduler):
             # [Omni] Generate KV offload/prefetch decisions
             kv_offload_decisions = None
             if self.kv_store_backend is not None:
+                # DEBUG: log usage and queue sizes every step
+                _usage = self.kv_cache_manager.usage
+                _n_running = len(self.running)
+                _n_waiting = len(self.waiting)
+                if _n_running > 0 and _n_waiting > 0:
+                    logger.info(
+                        "[Omni] Offload check: usage=%.4f, running=%d, waiting=%d, threshold=%.4f",
+                        _usage,
+                        _n_running,
+                        _n_waiting,
+                        self.offload_usage_threshold,
+                    )
                 kv_offload_decisions = self._generate_offload_decisions(scheduler_output)
         except Exception:
             # If anything goes wrong, leave the original output unchanged
@@ -242,24 +300,26 @@ class OmniARScheduler(VLLMScheduler):
         return omni_output
 
     def _generate_offload_decisions(self, scheduler_output: SchedulerOutput) -> dict[str, Any]:
-        """Generate save/load decisions following KVConnector convention.
+        """Generate offload/prefetch decisions using two-phase protocol.
 
-        Save: unconditionally copy KV to CPU for all running decode requests
-        every step (pure backup, blocks stay on GPU, request keeps running).
-        Load: when a preempted request with CPU backup gets re-scheduled,
-        load KV into new blocks instead of recomputing.
+        Offload (Phase 1): When GPU KV usage exceeds threshold and there are
+        waiting requests, select running decode requests to offload (largest KV
+        first). Runner extracts KV to CPU and acks via kv_extracted_req_ids.
+
+        Load: When an offloaded request gets re-scheduled from waiting, load
+        its KV from CPU into newly allocated GPU blocks.
 
         Returns:
-            {"save_req_ids": [...], "load_req_ids": [...],
+            {"offload_req_ids": [...], "load_req_ids": [...],
              "load_new_block_ids": {req_id: list[int]}}
         """
-        save_ids: list[str] = []
+        offload_ids: list[str] = []
         load_ids: list[str] = []
         load_new_block_ids: dict[str, list[int]] = {}
 
         scheduled = set(scheduler_output.num_scheduled_tokens.keys())
 
-        # --- Load: preempted requests with CPU backup that got re-scheduled ---
+        # --- Load: offloaded requests with CPU backup that got re-scheduled ---
         for req_id in list(self.offloaded_requests):
             if req_id in scheduled:
                 load_ids.append(req_id)
@@ -272,25 +332,42 @@ class OmniARScheduler(VLLMScheduler):
                 self.offloaded_requests.discard(req_id)
                 self.offloaded_metadata.pop(req_id, None)
 
-        # --- Save: unconditional for all running decode requests ---
-        for req in self.running:
-            rid = req.request_id
-            if (
-                rid in scheduled
-                and rid not in self.waiting_for_transfer_free
-                and req.num_computed_tokens > req.num_prompt_tokens
-            ):
-                save_ids.append(rid)
-
-        if save_ids or load_ids:
-            logger.debug(
-                "[Omni] KV decisions: save=%d reqs, load=%s",
-                len(save_ids),
-                load_ids,
+        # --- Offload: proactive threshold-based trigger ---
+        if self.kv_cache_manager.usage >= self.offload_usage_threshold and len(self.waiting) > 0:
+            # Build exclusion set
+            excluded = (
+                self.offload_pending_extract
+                | self.offload_pending_free
+                | self.offloaded_requests
+                | self.waiting_for_transfer_free
+                | self.active_kv_transfers
             )
+            # Select candidates: running decode requests, largest KV first
+            candidates = []
+            for req in self.running:
+                rid = req.request_id
+                if rid in scheduled and rid not in excluded and req.num_computed_tokens > req.num_prompt_tokens:
+                    candidates.append(req)
+            candidates.sort(key=lambda r: r.num_computed_tokens, reverse=True)
+
+            for req in candidates[: self.max_offloads_per_step]:
+                offload_ids.append(req.request_id)
+                self.offload_pending_extract.add(req.request_id)
+
+            if offload_ids:
+                logger.info(
+                    "[Omni] KV usage %.1f%% >= %.1f%% threshold, offloading %d requests: %s",
+                    self.kv_cache_manager.usage * 100,
+                    self.offload_usage_threshold * 100,
+                    len(offload_ids),
+                    offload_ids,
+                )
+
+        if load_ids:
+            logger.info("[Omni] Prefetching %d offloaded requests: %s", len(load_ids), load_ids)
 
         return {
-            "save_req_ids": save_ids,
+            "offload_req_ids": offload_ids,
             "load_req_ids": load_ids,
             "load_new_block_ids": load_new_block_ids,
         }
@@ -528,19 +605,31 @@ class OmniARScheduler(VLLMScheduler):
 
         # [Omni] Cleanup state for finished requests
         for req in stopped_running_reqs:
-            if req.request_id not in self.waiting_for_transfer_free:
-                if req.request_id in self.transfer_triggered_requests:
-                    self.transfer_triggered_requests.remove(req.request_id)
-                if req.request_id in self.active_kv_transfers:
-                    self.active_kv_transfers.remove(req.request_id)
+            rid = req.request_id
+            if rid not in self.waiting_for_transfer_free:
+                self.transfer_triggered_requests.discard(rid)
+                self.active_kv_transfers.discard(rid)
+            # Clean up offload state
+            self.offload_pending_extract.discard(rid)
+            self.offload_pending_free.discard(rid)
+            if rid in self.offloaded_requests:
+                self.offloaded_requests.discard(rid)
+                self.offloaded_metadata.pop(rid, None)
+            if self.kv_store_backend is not None:
+                try:
+                    self.kv_store_backend.evict_kv(rid)
+                except Exception:
+                    pass
 
         # Same for preempted
         for req in stopped_preempted_reqs:
-            if req.request_id not in self.waiting_for_transfer_free:
-                if req.request_id in self.transfer_triggered_requests:
-                    self.transfer_triggered_requests.remove(req.request_id)
-                if req.request_id in self.active_kv_transfers:
-                    self.active_kv_transfers.remove(req.request_id)
+            rid = req.request_id
+            if rid not in self.waiting_for_transfer_free:
+                self.transfer_triggered_requests.discard(rid)
+                self.active_kv_transfers.discard(rid)
+            # Clean up offload state
+            self.offload_pending_extract.discard(rid)
+            self.offload_pending_free.discard(rid)
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
@@ -586,11 +675,18 @@ class OmniARScheduler(VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        # Process extraction acks from runner (inter-stage KV transfers)
+        # Process extraction acks from runner (inter-stage KV transfers + offload)
         try:
             kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
             if kv_extracted_ids:
                 for req_id in kv_extracted_ids:
+                    # [Omni] Offload ack: move from pending_extract to pending_free
+                    if req_id in self.offload_pending_extract:
+                        self.offload_pending_extract.discard(req_id)
+                        self.offload_pending_free.add(req_id)
+                        logger.debug("[Omni] Offload extraction confirmed for %s, pending free", req_id)
+                        continue  # Not an inter-stage transfer ack
+
                     if req_id in self.active_kv_transfers:
                         self.active_kv_transfers.remove(req_id)
                         logger.debug("[Omni] KV Transfer finished for %s", req_id)
