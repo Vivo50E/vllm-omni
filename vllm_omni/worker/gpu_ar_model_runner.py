@@ -77,6 +77,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # [Omni] KV store backend for CPU offloading
         self.kv_store_backend = self._create_kv_store_backend()
+        self.offload_stream: torch.cuda.Stream | None = None  # lazy init for Phase 2
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -642,6 +643,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
             logger.warning("[Omni] KV store backend init failed: %s", e)
             return None
 
+    def _get_offload_stream(self) -> torch.cuda.Stream:
+        """Get or create the dedicated CUDA stream for offload transfers."""
+        if self.offload_stream is None:
+            self.offload_stream = torch.cuda.Stream()
+        return self.offload_stream
+
     def _execute_offload_extract(self, scheduler_output: SchedulerOutput) -> None:
         """Phase A: Extract KV from GPU to CPU for offload candidates.
 
@@ -660,15 +667,23 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if not offload_req_ids:
             return
 
-        block_size = self.cache_config.block_size
+        # [Omni] Lazy-init Phase 2 pinned CPU tensors on first offload
+        if hasattr(self.kv_store_backend, "init_tensors") and self.kv_caches:
+            self.kv_store_backend.init_tensors(self.kv_caches)
+
         for req_id in offload_req_ids:
             try:
-                kv_data = self._save_request_kv(req_id, block_size)
-                if kv_data and self.kv_store_backend.store_kv(req_id, kv_data):
+                if self._try_extract_via_swap_blocks(req_id):
                     self.kv_extracted_req_ids.append(req_id)
-                    logger.info("[Omni] Offload extract: saved KV for '%s' to CPU", req_id)
-                elif kv_data:
-                    logger.warning("[Omni] CPU store full, skipping offload for '%s'", req_id)
+                    logger.info("[Omni] Offload extract (swap_blocks): '%s'", req_id)
+                else:
+                    # Phase 1 fallback
+                    kv_data = self._save_request_kv(req_id, self.cache_config.block_size)
+                    if kv_data and self.kv_store_backend.store_kv(req_id, kv_data):
+                        self.kv_extracted_req_ids.append(req_id)
+                        logger.info("[Omni] Offload extract (fallback): '%s'", req_id)
+                    elif kv_data:
+                        logger.warning("[Omni] CPU store full, skipping offload for '%s'", req_id)
             except Exception as e:
                 logger.error("[Omni] Offload extract failed for '%s': %s", req_id, e)
 
@@ -688,27 +703,115 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if not load_req_ids:
             return
 
-        block_size = self.cache_config.block_size
         load_new_block_ids = decisions.get("load_new_block_ids", {})
 
         for req_id in load_req_ids:
             try:
-                kv_data = self.kv_store_backend.load_kv(req_id, target_device=str(self.device))
-                if kv_data:
-                    new_block_ids = load_new_block_ids.get(req_id)
-                    if not new_block_ids:
-                        req_state = self.requests.get(req_id)
-                        if req_state and req_state.block_ids:
-                            new_block_ids = list(req_state.block_ids[0])
-                    self._load_request_kv(req_id, kv_data, block_size, new_block_ids)
-                    self.kv_store_backend.evict_kv(req_id)
+                new_block_ids = load_new_block_ids.get(req_id)
+                if not new_block_ids:
+                    req_state = self.requests.get(req_id)
+                    if req_state and req_state.block_ids:
+                        new_block_ids = list(req_state.block_ids[0])
+
+                if self._try_inject_via_swap_blocks(req_id, new_block_ids):
                     logger.info(
-                        "[Omni] Loaded KV for '%s' into blocks %s...",
+                        "[Omni] Loaded KV (swap_blocks) for '%s' into %s...",
                         req_id,
                         new_block_ids[:4] if new_block_ids else [],
                     )
+                else:
+                    # Phase 1 fallback
+                    kv_data = self.kv_store_backend.load_kv(req_id, target_device=str(self.device))
+                    if kv_data:
+                        self._load_request_kv(req_id, kv_data, self.cache_config.block_size, new_block_ids)
+                        logger.info(
+                            "[Omni] Loaded KV (fallback) for '%s' into %s...",
+                            req_id,
+                            new_block_ids[:4] if new_block_ids else [],
+                        )
+                self.kv_store_backend.evict_kv(req_id)
             except Exception as e:
                 logger.error("[Omni] KV load failed for '%s': %s", req_id, e)
+
+    # ----------------------------------------------------------------
+    # [Omni] Phase 2: swap_blocks-based transfer (pinned memory + CUDA stream)
+    # ----------------------------------------------------------------
+
+    def _try_extract_via_swap_blocks(self, req_id: str) -> bool:
+        """Try to extract KV via swap_blocks. Returns False to fall back to Phase 1."""
+        if not getattr(self.kv_store_backend, "supports_block_transfer", False):
+            return False
+
+        from vllm._custom_ops import swap_blocks
+
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return False
+
+        gpu_block_ids = list(req_state.block_ids[0]) if req_state.block_ids else []
+        if not gpu_block_ids:
+            return False
+
+        seq_len = req_state.num_computed_tokens
+        block_size = self.cache_config.block_size
+        num_data_blocks = (seq_len + block_size - 1) // block_size if seq_len > 0 else len(gpu_block_ids)
+        num_data_blocks = min(num_data_blocks, len(gpu_block_ids))
+        gpu_block_ids = gpu_block_ids[:num_data_blocks]
+
+        # Allocate CPU blocks
+        cpu_block_ids = self.kv_store_backend.allocate_blocks(req_id, num_data_blocks, seq_len)
+        if cpu_block_ids is None:
+            return False
+
+        # Build block mapping: [[gpu_block, cpu_block], ...]
+        block_mapping = torch.tensor(list(zip(gpu_block_ids, cpu_block_ids)), dtype=torch.int64)
+
+        cpu_kv_caches = self.kv_store_backend.get_cpu_kv_caches()
+        stream = self._get_offload_stream()
+        with torch.cuda.stream(stream):
+            for layer_idx, layer_kv in enumerate(self.kv_caches):
+                cpu_kv = cpu_kv_caches[layer_idx]
+                # layer_kv: [2, num_blocks, block_size, heads, dim]
+                # Unbind K/V, swap_blocks each separately
+                k_gpu, v_gpu = layer_kv.unbind(0)
+                k_cpu, v_cpu = cpu_kv.unbind(0)
+                block_bytes = k_gpu.element_size() * k_gpu.stride(0)
+                swap_blocks(k_gpu, k_cpu, block_bytes, block_mapping)
+                swap_blocks(v_gpu, v_cpu, block_bytes, block_mapping)
+        stream.synchronize()
+        return True
+
+    def _try_inject_via_swap_blocks(self, req_id: str, new_gpu_block_ids: list[int] | None) -> bool:
+        """Try to inject KV via swap_blocks. Returns False to fall back to Phase 1."""
+        if not getattr(self.kv_store_backend, "supports_block_transfer", False):
+            return False
+
+        from vllm._custom_ops import swap_blocks
+
+        cpu_block_ids = self.kv_store_backend.get_cpu_block_ids(req_id)
+        if cpu_block_ids is None or not new_gpu_block_ids:
+            return False
+
+        num_blocks = min(len(cpu_block_ids), len(new_gpu_block_ids))
+        cpu_block_ids = cpu_block_ids[:num_blocks]
+        new_gpu_block_ids = new_gpu_block_ids[:num_blocks]
+
+        # Block mapping: [[cpu_block, gpu_block], ...]
+        block_mapping = torch.tensor(list(zip(cpu_block_ids, new_gpu_block_ids)), dtype=torch.int64)
+
+        cpu_kv_caches = self.kv_store_backend.get_cpu_kv_caches()
+        stream = self._get_offload_stream()
+        with torch.cuda.stream(stream):
+            for layer_idx, layer_kv in enumerate(self.kv_caches):
+                cpu_kv = cpu_kv_caches[layer_idx]
+                k_gpu, v_gpu = layer_kv.unbind(0)
+                k_cpu, v_cpu = cpu_kv.unbind(0)
+                block_bytes = k_gpu.element_size() * k_gpu.stride(0)
+                swap_blocks(k_cpu, k_gpu, block_bytes, block_mapping)
+                swap_blocks(v_cpu, v_gpu, block_bytes, block_mapping)
+        # Must sync before forward pass reads the KV
+        stream.synchronize()
+        return True
 
     def _save_request_kv(self, req_id: str, block_size: int) -> dict | None:
         """Save KV cache tensors for a request from GPU to CPU (swap-out).
