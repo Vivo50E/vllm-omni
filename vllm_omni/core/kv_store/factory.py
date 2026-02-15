@@ -17,7 +17,7 @@ class OmniKvStoreFactory:
         """Register a kv store backend class with a given name.
 
         Args:
-            name (str): The name of the backend.
+            backend_name (str): The name of the backend.
             backend_cls (Type[OmniKvStoreBackend]): The backend class to register
         """
 
