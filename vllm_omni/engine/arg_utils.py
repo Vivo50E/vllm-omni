@@ -67,6 +67,9 @@ class OmniEngineArgs(EngineArgs):
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
             If not specified, will be inferred from model path.
+        omni_kv_config: KV cache configuration for offloading and inter-stage transfer.
+            When kv_store_config.enable_offload is True, automatically maps to
+            vLLM v1's OffloadingConnector via kv_offloading_size.
     """
 
     stage_id: int = 0
@@ -82,8 +85,37 @@ class OmniEngineArgs(EngineArgs):
     worker_type: str | None = None
     task_type: str | None = None
 
+    def _map_offload_config(self) -> None:
+        """[Omni] Map omni_kv_config offload settings to vLLM's kv_offloading_size.
+
+        Bridges Omni's YAML config surface to vLLM v1's OffloadingConnector
+        activation path. When kv_offloading_size is set, VllmConfig.__post_init__()
+        automatically creates KVTransferConfig with kv_connector="OffloadingConnector".
+
+        Supported kv_store_config keys:
+            enable_offload: bool - enable CPU KV offloading
+            max_cpu_memory_gb: float - CPU memory budget (default 10.0)
+            eviction_policy: str - "lru" (default) or "arc" (adaptive)
+        """
+        if not self.omni_kv_config or self.kv_offloading_size is not None:
+            return
+        kv_store = self.omni_kv_config.get("kv_store_config", {}) if isinstance(self.omni_kv_config, dict) else {}
+        if kv_store.get("enable_offload"):
+            self.kv_offloading_size = kv_store.get("max_cpu_memory_gb", 10.0)
+            # OffloadingConnector requires HMA to be disabled
+            self.disable_hybrid_kv_cache_manager = True
+            # Note: eviction_policy "arc" has a known upstream bug (vLLM v0.15).
+            # Only "lru" (default) is supported. Warn and ignore if "arc" is set.
+            eviction_policy = kv_store.get("eviction_policy")
+            if eviction_policy and eviction_policy != "lru":
+                logger.warning(
+                    "[Omni] eviction_policy='%s' is not supported (upstream bug). Falling back to 'lru'.",
+                    eviction_policy,
+                )
+
     def __post_init__(self) -> None:
         load_omni_general_plugins()
+        self._map_offload_config()
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):
@@ -242,8 +274,26 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     worker_type: str | None = None
     task_type: str | None = None
 
+    def _map_offload_config(self) -> None:
+        """[Omni] Map omni_kv_config offload settings to vLLM's kv_offloading_size."""
+        if not self.omni_kv_config or self.kv_offloading_size is not None:
+            return
+        kv_store = self.omni_kv_config.get("kv_store_config", {}) if isinstance(self.omni_kv_config, dict) else {}
+        if kv_store.get("enable_offload"):
+            self.kv_offloading_size = kv_store.get("max_cpu_memory_gb", 10.0)
+            self.disable_hybrid_kv_cache_manager = True
+            eviction_policy = kv_store.get("eviction_policy")
+            if eviction_policy:
+                if self.kv_transfer_config is None:
+                    self.kv_transfer_config = {}
+                extra = self.kv_transfer_config if isinstance(self.kv_transfer_config, dict) else {}
+                if "kv_connector_extra_config" not in extra:
+                    extra["kv_connector_extra_config"] = {}
+                extra["kv_connector_extra_config"]["eviction_policy"] = eviction_policy
+
     def __post_init__(self) -> None:
         load_omni_general_plugins()
+        self._map_offload_config()
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):

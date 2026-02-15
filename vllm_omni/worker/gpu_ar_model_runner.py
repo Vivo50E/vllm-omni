@@ -33,7 +33,6 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
-from vllm_omni.core.kv_store import OmniKvStoreFactory
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -75,10 +74,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
 
-        # [Omni] KV store backend for CPU offloading
-        self.kv_store_backend = self._create_kv_store_backend()
-        self.offload_stream: torch.cuda.Stream | None = None  # lazy init for Phase 2
-
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
         from vllm_omni.distributed.ray_utils.utils import (
@@ -110,10 +105,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
             request_id_resolver=self._resolve_global_request_id,
         )
 
-        # [Omni] Offload Phase A: extract KV to CPU BEFORE _update_states
-        # (needs old block IDs that are still valid on GPU)
-        self._execute_offload_extract(scheduler_output)
-
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -131,10 +122,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
-
-            # [Omni] Offload Phase B: load KV from CPU AFTER _update_states
-            # (needs new block IDs from newly scheduled/resumed requests)
-            self._execute_offload_load(scheduler_output)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -620,256 +607,3 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 return global_id.decode("utf-8")
             return str(global_id)
         return req_id
-
-    # =================================================================
-    # KV store offloading helpers
-    # =================================================================
-
-    def _create_kv_store_backend(self):
-        """Create KV store backend from model config."""
-        omni_kv_config = getattr(self.vllm_config.model_config, "omni_kv_config", None)
-        if not omni_kv_config:
-            return None
-        kv_store_config = (
-            omni_kv_config.get("kv_store_config", None)
-            if isinstance(omni_kv_config, dict)
-            else getattr(omni_kv_config, "kv_store_config", None)
-        )
-        if not kv_store_config or not kv_store_config.get("enable_offload"):
-            return None
-        try:
-            return OmniKvStoreFactory.create("x", kv_store_config)
-        except Exception as e:
-            logger.warning("[Omni] KV store backend init failed: %s", e)
-            return None
-
-    def _get_offload_stream(self) -> torch.cuda.Stream:
-        """Get or create the dedicated CUDA stream for offload transfers."""
-        if self.offload_stream is None:
-            self.offload_stream = torch.cuda.Stream()
-        return self.offload_stream
-
-    def _execute_offload_extract(self, scheduler_output: SchedulerOutput) -> None:
-        """Phase A: Extract KV from GPU to CPU for offload candidates.
-
-        Called BEFORE _update_states so we can read the current (old) block IDs.
-        Successfully extracted req_ids are appended to self.kv_extracted_req_ids
-        to flow back to the scheduler as acknowledgments.
-        """
-        if self.kv_store_backend is None:
-            return
-
-        decisions = getattr(scheduler_output, "kv_offload_decisions", None)
-        if not decisions:
-            return
-
-        offload_req_ids = decisions.get("offload_req_ids", [])
-        if not offload_req_ids:
-            return
-
-        # [Omni] Lazy-init Phase 2 pinned CPU tensors on first offload
-        if hasattr(self.kv_store_backend, "init_tensors") and self.kv_caches:
-            self.kv_store_backend.init_tensors(self.kv_caches)
-
-        for req_id in offload_req_ids:
-            try:
-                if self._try_extract_via_swap_blocks(req_id):
-                    self.kv_extracted_req_ids.append(req_id)
-                    logger.info("[Omni] Offload extract (swap_blocks): '%s'", req_id)
-                else:
-                    # Phase 1 fallback
-                    kv_data = self._save_request_kv(req_id, self.cache_config.block_size)
-                    if kv_data and self.kv_store_backend.store_kv(req_id, kv_data):
-                        self.kv_extracted_req_ids.append(req_id)
-                        logger.info("[Omni] Offload extract (fallback): '%s'", req_id)
-                    elif kv_data:
-                        logger.warning("[Omni] CPU store full, skipping offload for '%s'", req_id)
-            except Exception as e:
-                logger.error("[Omni] Offload extract failed for '%s': %s", req_id, e)
-
-    def _execute_offload_load(self, scheduler_output: SchedulerOutput) -> None:
-        """Phase B: Load KV from CPU into newly allocated GPU blocks.
-
-        Called AFTER _update_states so resumed requests have new block IDs.
-        """
-        if self.kv_store_backend is None:
-            return
-
-        decisions = getattr(scheduler_output, "kv_offload_decisions", None)
-        if not decisions:
-            return
-
-        load_req_ids = decisions.get("load_req_ids", [])
-        if not load_req_ids:
-            return
-
-        load_new_block_ids = decisions.get("load_new_block_ids", {})
-
-        for req_id in load_req_ids:
-            try:
-                new_block_ids = load_new_block_ids.get(req_id)
-                if not new_block_ids:
-                    req_state = self.requests.get(req_id)
-                    if req_state and req_state.block_ids:
-                        new_block_ids = list(req_state.block_ids[0])
-
-                if self._try_inject_via_swap_blocks(req_id, new_block_ids):
-                    logger.info(
-                        "[Omni] Loaded KV (swap_blocks) for '%s' into %s...",
-                        req_id,
-                        new_block_ids[:4] if new_block_ids else [],
-                    )
-                else:
-                    # Phase 1 fallback
-                    kv_data = self.kv_store_backend.load_kv(req_id, target_device=str(self.device))
-                    if kv_data:
-                        self._load_request_kv(req_id, kv_data, self.cache_config.block_size, new_block_ids)
-                        logger.info(
-                            "[Omni] Loaded KV (fallback) for '%s' into %s...",
-                            req_id,
-                            new_block_ids[:4] if new_block_ids else [],
-                        )
-                self.kv_store_backend.evict_kv(req_id)
-            except Exception as e:
-                logger.error("[Omni] KV load failed for '%s': %s", req_id, e)
-
-    # ----------------------------------------------------------------
-    # [Omni] Phase 2: swap_blocks-based transfer (pinned memory + CUDA stream)
-    # ----------------------------------------------------------------
-
-    def _try_extract_via_swap_blocks(self, req_id: str) -> bool:
-        """Try to extract KV via swap_blocks. Returns False to fall back to Phase 1."""
-        if not getattr(self.kv_store_backend, "supports_block_transfer", False):
-            return False
-
-        from vllm._custom_ops import swap_blocks
-
-        req_state = self.requests.get(req_id)
-        if req_state is None:
-            return False
-
-        gpu_block_ids = list(req_state.block_ids[0]) if req_state.block_ids else []
-        if not gpu_block_ids:
-            return False
-
-        seq_len = req_state.num_computed_tokens
-        block_size = self.cache_config.block_size
-        num_data_blocks = (seq_len + block_size - 1) // block_size if seq_len > 0 else len(gpu_block_ids)
-        num_data_blocks = min(num_data_blocks, len(gpu_block_ids))
-        gpu_block_ids = gpu_block_ids[:num_data_blocks]
-
-        # Allocate CPU blocks
-        cpu_block_ids = self.kv_store_backend.allocate_blocks(req_id, num_data_blocks, seq_len)
-        if cpu_block_ids is None:
-            return False
-
-        # Build block mapping: [[gpu_block, cpu_block], ...]
-        block_mapping = torch.tensor(list(zip(gpu_block_ids, cpu_block_ids)), dtype=torch.int64)
-
-        cpu_kv_caches = self.kv_store_backend.get_cpu_kv_caches()
-        stream = self._get_offload_stream()
-        with torch.cuda.stream(stream):
-            for layer_idx, layer_kv in enumerate(self.kv_caches):
-                cpu_kv = cpu_kv_caches[layer_idx]
-                # layer_kv: [2, num_blocks, block_size, heads, dim]
-                # Unbind K/V, swap_blocks each separately
-                k_gpu, v_gpu = layer_kv.unbind(0)
-                k_cpu, v_cpu = cpu_kv.unbind(0)
-                block_bytes = k_gpu.element_size() * k_gpu.stride(0)
-                swap_blocks(k_gpu, k_cpu, block_bytes, block_mapping)
-                swap_blocks(v_gpu, v_cpu, block_bytes, block_mapping)
-        stream.synchronize()
-        return True
-
-    def _try_inject_via_swap_blocks(self, req_id: str, new_gpu_block_ids: list[int] | None) -> bool:
-        """Try to inject KV via swap_blocks. Returns False to fall back to Phase 1."""
-        if not getattr(self.kv_store_backend, "supports_block_transfer", False):
-            return False
-
-        from vllm._custom_ops import swap_blocks
-
-        cpu_block_ids = self.kv_store_backend.get_cpu_block_ids(req_id)
-        if cpu_block_ids is None or not new_gpu_block_ids:
-            return False
-
-        num_blocks = min(len(cpu_block_ids), len(new_gpu_block_ids))
-        cpu_block_ids = cpu_block_ids[:num_blocks]
-        new_gpu_block_ids = new_gpu_block_ids[:num_blocks]
-
-        # Block mapping: [[cpu_block, gpu_block], ...]
-        block_mapping = torch.tensor(list(zip(cpu_block_ids, new_gpu_block_ids)), dtype=torch.int64)
-
-        cpu_kv_caches = self.kv_store_backend.get_cpu_kv_caches()
-        stream = self._get_offload_stream()
-        with torch.cuda.stream(stream):
-            for layer_idx, layer_kv in enumerate(self.kv_caches):
-                cpu_kv = cpu_kv_caches[layer_idx]
-                k_gpu, v_gpu = layer_kv.unbind(0)
-                k_cpu, v_cpu = cpu_kv.unbind(0)
-                block_bytes = k_gpu.element_size() * k_gpu.stride(0)
-                swap_blocks(k_cpu, k_gpu, block_bytes, block_mapping)
-                swap_blocks(v_cpu, v_gpu, block_bytes, block_mapping)
-        # Must sync before forward pass reads the KV
-        stream.synchronize()
-        return True
-
-    def _save_request_kv(self, req_id: str, block_size: int) -> dict | None:
-        """Save KV cache tensors for a request from GPU to CPU (swap-out).
-
-        Follows vLLM KVConnector convention: save_kv extracts GPU tensors
-        for the given request's blocks and returns a CPU-resident dict.
-        """
-        req_state = self.requests.get(req_id)
-        if req_state is None:
-            return None
-
-        block_ids = req_state.block_ids[0] if req_state.block_ids else []
-        if not block_ids:
-            return None
-
-        seq_len = req_state.num_computed_tokens
-        kv_caches_cpu = []
-        for layer_kv in self.kv_caches:
-            # layer_kv shape: [2, num_blocks, block_size, n_heads, head_dim]
-            selected = layer_kv[:, block_ids].detach().cpu().contiguous()
-            kv_caches_cpu.append(selected)
-
-        return {
-            "kv_caches": kv_caches_cpu,
-            "block_ids": list(block_ids),
-            "seq_len": seq_len,
-        }
-
-    def _load_request_kv(
-        self, req_id: str, kv_data: dict, block_size: int, new_block_ids: list[int] | None = None
-    ) -> None:
-        """Load KV cache tensors from CPU back into GPU blocks (swap-in).
-
-        Follows vLLM KVConnector convention: load_kv writes CPU tensors
-        into the target GPU blocks.
-
-        Args:
-            new_block_ids: If provided, use these (newly allocated) block IDs
-                instead of the old ones stored in kv_data.  The saved tensors
-                are mapped positionally: saved_block[0] -> new_block_ids[0].
-        """
-        seq_len = kv_data.get("seq_len", 0)
-        old_block_ids = kv_data.get("block_ids", [])
-        target_ids = new_block_ids if new_block_ids else old_block_ids
-        if not target_ids:
-            return
-
-        # Only load blocks that contain actual data
-        num_data_blocks = min(
-            (seq_len + block_size - 1) // block_size if seq_len > 0 else len(old_block_ids),
-            len(old_block_ids),
-            len(target_ids),
-        )
-        target_ids = target_ids[:num_data_blocks]
-
-        kv_caches = kv_data["kv_caches"]
-        for layer_idx, layer_kv in enumerate(self.kv_caches):
-            if layer_idx < len(kv_caches):
-                src = kv_caches[layer_idx].to(self.device)
-                # Positional mapping: src[:, i] -> layer_kv[:, target_ids[i]]
-                layer_kv[:, target_ids] = src[:, :num_data_blocks]
