@@ -219,7 +219,15 @@ class LMCacheBackend(OmniKvStoreBackend):
             "seq_len": kv_data.get("seq_len"),
         }
 
-    def __del__(self):
+    def close(self) -> None:
+        """Explicitly destroy the LMCache engine used by this backend.
+
+        Call this when the backend is no longer needed. Not invoked
+        automatically to avoid tearing down a shared LMCache engine
+        that may be used by other components.
+        """
+        if not LMCACHE_AVAILABLE:
+            return
         try:
             LMCacheEngineBuilder.destroy(self.ENGINE_NAME)
             logger.info("Destroyed LMCache engine '%s'", self.ENGINE_NAME)

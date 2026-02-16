@@ -112,26 +112,30 @@ class TestOmniKvStoreBackend:
 class TestOmniKvStoreFactory:
     @pytest.fixture(autouse=True)
     def _clean(self):
+        # Snapshot the default registry so we can restore it after each test,
+        # avoiding global state leakage to other test modules.
+        saved = dict(OmniKvStoreFactory._registry)
         OmniKvStoreFactory.clear_registry()
         yield
-        OmniKvStoreFactory.clear_registry()
+        OmniKvStoreFactory._registry.clear()
+        OmniKvStoreFactory._registry.update(saved)
 
     def test_register_and_create(self):
         OmniKvStoreFactory.register("mock", MockBackend)
-        backend = OmniKvStoreFactory.create("mock", {"backend_type": "mock"})
+        backend = OmniKvStoreFactory.create({"backend_type": "mock"})
         assert isinstance(backend, MockBackend)
 
     def test_create_none_disabled(self):
-        result = OmniKvStoreFactory.create("x", {"backend_type": "none"})
+        result = OmniKvStoreFactory.create({"backend_type": "none"})
         assert result is None
 
     def test_create_default_disabled(self):
-        result = OmniKvStoreFactory.create("x", {})
+        result = OmniKvStoreFactory.create({})
         assert result is None
 
     def test_create_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown backend"):
-            OmniKvStoreFactory.create("x", {"backend_type": "unknown"})
+            OmniKvStoreFactory.create({"backend_type": "unknown"})
 
     def test_list_backends(self):
         OmniKvStoreFactory.register("a", MockBackend)

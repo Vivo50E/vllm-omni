@@ -75,7 +75,6 @@ def _register_backend():
 @pytest.fixture
 def backend():
     return OmniKvStoreFactory.create(
-        "x",
         {
             "backend_type": "in_memory",
             "enable_offload": True,

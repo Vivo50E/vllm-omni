@@ -27,18 +27,21 @@ class OmniKvStoreFactory:
         logger.info(f"Registered kv store backend '{backend_name}'.")
 
     @classmethod
-    def create(cls, backend_name: str, config: dict[str, Any]) -> OmniKvStoreBackend:
-        """Create an instance of the specified kv store backend.
+    def create(cls, config: dict[str, Any]) -> OmniKvStoreBackend | None:
+        """Create an instance of a kv store backend based on config.
+
+        Backend selection is driven by ``config["backend_type"]``.
 
         Args:
-            backend_name (str): The name of the backend to create.
-            config (dict[str, Any]): Configuration dictionary for the backend.
+            config: Configuration dictionary. Must contain ``backend_type``
+                (e.g. ``"cpu"``, ``"lmcache"``, or ``"none"`` to disable).
 
         Returns:
-            OmniKvStoreBackend: An instance of the requested kv store backend.
+            An ``OmniKvStoreBackend`` instance, or ``None`` if offloading
+            is disabled (``backend_type`` is ``"none"`` or absent).
 
         Raises:
-            ValueError: If the specified backend is not registered.
+            ValueError: If the specified backend type is not registered.
         """
 
         backend_type = config.get("backend_type", "none")

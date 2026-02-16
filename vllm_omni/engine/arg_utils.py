@@ -283,13 +283,11 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
             self.kv_offloading_size = kv_store.get("max_cpu_memory_gb", 10.0)
             self.disable_hybrid_kv_cache_manager = True
             eviction_policy = kv_store.get("eviction_policy")
-            if eviction_policy:
-                if self.kv_transfer_config is None:
-                    self.kv_transfer_config = {}
-                extra = self.kv_transfer_config if isinstance(self.kv_transfer_config, dict) else {}
-                if "kv_connector_extra_config" not in extra:
-                    extra["kv_connector_extra_config"] = {}
-                extra["kv_connector_extra_config"]["eviction_policy"] = eviction_policy
+            if eviction_policy and eviction_policy != "lru":
+                logger.warning(
+                    "[Omni] eviction_policy='%s' is not supported (upstream bug). Falling back to 'lru'.",
+                    eviction_policy,
+                )
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
