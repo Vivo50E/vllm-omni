@@ -45,6 +45,115 @@ def register_omni_models_to_vllm():
             ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
 
+def _build_connector_list(
+    kv_store: dict, lmcache_config: dict
+) -> list[dict]:
+    """Build the connector list for MultiConnector from omni_kv_config.
+
+    Returns a list of connector dicts, each with ``connector_class``
+    and ``config`` keys matching vLLM's MultiConnector schema.
+    """
+    connectors: list[dict] = []
+
+    # OffloadingConnector (if offload is enabled)
+    if kv_store.get("enable_offload"):
+        offload_cfg: dict = {}
+        max_cpu_gb = kv_store.get("max_cpu_memory_gb")
+        if max_cpu_gb is not None:
+            offload_cfg["max_cpu_memory_gb"] = max_cpu_gb
+        connectors.append(
+            {
+                "connector_class": "OffloadingConnector",
+                "config": offload_cfg,
+            }
+        )
+
+    # LMCacheConnector
+    lmcache_cfg: dict = {}
+    if isinstance(lmcache_config, dict):
+        lmcache_cfg = lmcache_config.copy()
+    connectors.append(
+        {
+            "connector_class": "LMCacheConnector",
+            "config": lmcache_cfg,
+        }
+    )
+
+    return connectors
+
+
+def _map_offload_config(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
+    """Map omni_kv_config to vLLM's KV transfer infrastructure.
+
+    Bridges Omni's YAML config surface to vLLM v1's connector activation
+    paths.  Supports three modes:
+
+    1. Offload only  → sets ``kv_offloading_size`` → OffloadingConnector
+    2. LMCache only  → sets ``kv_transfer_config`` → LMCacheConnector
+    3. Offload + LMCache → sets ``kv_transfer_config`` → MultiConnector
+
+    Supported ``kv_store_config`` keys:
+        enable_offload   : bool  – enable CPU KV offloading
+        max_cpu_memory_gb: float – CPU memory budget (default 10.0)
+        lmcache_config   : dict  – LMCache connector configuration
+        kv_role          : str   – vLLM KV role (default ``"kv_both"``)
+    """
+    if not args.omni_kv_config:
+        return
+    kv_store = (
+        args.omni_kv_config.get("kv_store_config", {})
+        if isinstance(args.omni_kv_config, dict)
+        else {}
+    )
+
+    enable_offload = kv_store.get("enable_offload", False)
+    lmcache_config = kv_store.get("lmcache_config")
+
+    if lmcache_config:
+        # MultiConnector mode: LMCache + optionally OffloadingConnector
+        connectors = _build_connector_list(kv_store, lmcache_config)
+
+        from vllm.config.kv_transfer import KVTransferConfig
+
+        kv_role = kv_store.get("kv_role", "kv_both")
+
+        if len(connectors) == 1:
+            # Single connector (LMCache only, no offload)
+            entry = connectors[0]
+            args.kv_transfer_config = KVTransferConfig(
+                kv_connector=entry["connector_class"],
+                kv_connector_extra_config=entry.get("config", {}),
+                kv_role=kv_role,
+            )
+        else:
+            # Multiple connectors → MultiConnector
+            args.kv_transfer_config = KVTransferConfig(
+                kv_connector="MultiConnector",
+                kv_connector_extra_config={"connectors": connectors},
+                kv_role=kv_role,
+            )
+
+        if enable_offload:
+            # OffloadingConnector requires HMA disabled and
+            # kv_offloading_size for CPU block budget calculation.
+            args.disable_hybrid_kv_cache_manager = True
+            if args.kv_offloading_size is None:
+                args.kv_offloading_size = kv_store.get(
+                    "max_cpu_memory_gb", 10.0
+                )
+
+        logger.info(
+            "[Omni] kv_transfer_config: kv_connector=%s, connectors=%s",
+            args.kv_transfer_config.kv_connector,
+            [c["connector_class"] for c in connectors],
+        )
+
+    elif enable_offload and args.kv_offloading_size is None:
+        # Simple offload mode
+        args.kv_offloading_size = kv_store.get("max_cpu_memory_gb", 10.0)
+        args.disable_hybrid_kv_cache_manager = True
+
+
 @dataclass
 class OmniEngineArgs(EngineArgs):
     """Engine arguments for omni models, extending base EngineArgs.
@@ -85,37 +194,9 @@ class OmniEngineArgs(EngineArgs):
     worker_type: str | None = None
     task_type: str | None = None
 
-    def _map_offload_config(self) -> None:
-        """[Omni] Map omni_kv_config offload settings to vLLM's kv_offloading_size.
-
-        Bridges Omni's YAML config surface to vLLM v1's OffloadingConnector
-        activation path. When kv_offloading_size is set, VllmConfig.__post_init__()
-        automatically creates KVTransferConfig with kv_connector="OffloadingConnector".
-
-        Supported kv_store_config keys:
-            enable_offload: bool - enable CPU KV offloading
-            max_cpu_memory_gb: float - CPU memory budget (default 10.0)
-            eviction_policy: str - "lru" (default) or "arc" (adaptive)
-        """
-        if not self.omni_kv_config or self.kv_offloading_size is not None:
-            return
-        kv_store = self.omni_kv_config.get("kv_store_config", {}) if isinstance(self.omni_kv_config, dict) else {}
-        if kv_store.get("enable_offload"):
-            self.kv_offloading_size = kv_store.get("max_cpu_memory_gb", 10.0)
-            # OffloadingConnector requires HMA to be disabled
-            self.disable_hybrid_kv_cache_manager = True
-            # Note: eviction_policy "arc" has a known upstream bug (vLLM v0.15).
-            # Only "lru" (default) is supported. Warn and ignore if "arc" is set.
-            eviction_policy = kv_store.get("eviction_policy")
-            if eviction_policy and eviction_policy != "lru":
-                logger.warning(
-                    "[Omni] eviction_policy='%s' is not supported (upstream bug). Falling back to 'lru'.",
-                    eviction_policy,
-                )
-
     def __post_init__(self) -> None:
         load_omni_general_plugins()
-        self._map_offload_config()
+        _map_offload_config(self)
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):
@@ -274,24 +355,9 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     worker_type: str | None = None
     task_type: str | None = None
 
-    def _map_offload_config(self) -> None:
-        """[Omni] Map omni_kv_config offload settings to vLLM's kv_offloading_size."""
-        if not self.omni_kv_config or self.kv_offloading_size is not None:
-            return
-        kv_store = self.omni_kv_config.get("kv_store_config", {}) if isinstance(self.omni_kv_config, dict) else {}
-        if kv_store.get("enable_offload"):
-            self.kv_offloading_size = kv_store.get("max_cpu_memory_gb", 10.0)
-            self.disable_hybrid_kv_cache_manager = True
-            eviction_policy = kv_store.get("eviction_policy")
-            if eviction_policy and eviction_policy != "lru":
-                logger.warning(
-                    "[Omni] eviction_policy='%s' is not supported (upstream bug). Falling back to 'lru'.",
-                    eviction_policy,
-                )
-
     def __post_init__(self) -> None:
         load_omni_general_plugins()
-        self._map_offload_config()
+        _map_offload_config(self)
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):
