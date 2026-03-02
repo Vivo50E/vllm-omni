@@ -50,32 +50,33 @@ def _build_connector_list(
 ) -> list[dict]:
     """Build the connector list for MultiConnector from omni_kv_config.
 
-    Returns a list of connector dicts, each with ``connector_class``
-    and ``config`` keys matching vLLM's MultiConnector schema.
+    Each entry is a dict that can be unpacked into ``KVTransferConfig(**entry)``
+    by vLLM's ``MultiConnector._get_connector_classes_and_configs()``.
     """
     connectors: list[dict] = []
 
     # OffloadingConnector (if offload is enabled)
     if kv_store.get("enable_offload"):
-        offload_cfg: dict = {}
-        max_cpu_gb = kv_store.get("max_cpu_memory_gb")
-        if max_cpu_gb is not None:
-            offload_cfg["max_cpu_memory_gb"] = max_cpu_gb
+        max_cpu_gb = kv_store.get("max_cpu_memory_gb", 10.0)
         connectors.append(
             {
-                "connector_class": "OffloadingConnector",
-                "config": offload_cfg,
+                "kv_connector": "OffloadingConnector",
+                "kv_role": "kv_both",
+                "kv_connector_extra_config": {
+                    "cpu_bytes_to_use": max_cpu_gb * (1 << 30),
+                },
             }
         )
 
-    # LMCacheConnector
-    lmcache_cfg: dict = {}
+    # LMCacheConnectorV1
+    lmcache_extra: dict = {}
     if isinstance(lmcache_config, dict):
-        lmcache_cfg = lmcache_config.copy()
+        lmcache_extra = lmcache_config.copy()
     connectors.append(
         {
-            "connector_class": "LMCacheConnector",
-            "config": lmcache_cfg,
+            "kv_connector": "LMCacheConnectorV1",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": lmcache_extra,
         }
     )
 
@@ -89,7 +90,7 @@ def _map_offload_config(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
     paths.  Supports three modes:
 
     1. Offload only  → sets ``kv_offloading_size`` → OffloadingConnector
-    2. LMCache only  → sets ``kv_transfer_config`` → LMCacheConnector
+    2. LMCache only  → sets ``kv_transfer_config`` → LMCacheConnectorV1
     3. Offload + LMCache → sets ``kv_transfer_config`` → MultiConnector
 
     Supported ``kv_store_config`` keys:
@@ -121,8 +122,10 @@ def _map_offload_config(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
             # Single connector (LMCache only, no offload)
             entry = connectors[0]
             args.kv_transfer_config = KVTransferConfig(
-                kv_connector=entry["connector_class"],
-                kv_connector_extra_config=entry.get("config", {}),
+                kv_connector=entry["kv_connector"],
+                kv_connector_extra_config=entry.get(
+                    "kv_connector_extra_config", {}
+                ),
                 kv_role=kv_role,
             )
         else:
@@ -134,18 +137,18 @@ def _map_offload_config(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
             )
 
         if enable_offload:
-            # OffloadingConnector requires HMA disabled and
-            # kv_offloading_size for CPU block budget calculation.
+            # OffloadingConnector requires HMA disabled.
+            # NOTE: Do NOT set kv_offloading_size here — VllmConfig's
+            # _post_init_kv_transfer_config() would override kv_connector
+            # to "OffloadingConnector", clobbering our MultiConnector.
+            # Instead, pass cpu_bytes_to_use via the OffloadingConnector's
+            # config dict inside MultiConnector's connector list.
             args.disable_hybrid_kv_cache_manager = True
-            if args.kv_offloading_size is None:
-                args.kv_offloading_size = kv_store.get(
-                    "max_cpu_memory_gb", 10.0
-                )
 
         logger.info(
             "[Omni] kv_transfer_config: kv_connector=%s, connectors=%s",
             args.kv_transfer_config.kv_connector,
-            [c["connector_class"] for c in connectors],
+            [c["kv_connector"] for c in connectors],
         )
 
     elif enable_offload and args.kv_offloading_size is None:
