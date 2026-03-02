@@ -45,9 +45,7 @@ def register_omni_models_to_vllm():
             ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
 
-def _build_connector_list(
-    kv_store: dict, lmcache_config: dict
-) -> list[dict]:
+def _build_connector_list(kv_store: dict, lmcache_config: dict) -> list[dict]:
     """Build the connector list for MultiConnector from omni_kv_config.
 
     Each entry is a dict that can be unpacked into ``KVTransferConfig(**entry)``
@@ -101,11 +99,7 @@ def _map_offload_config(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
     """
     if not args.omni_kv_config:
         return
-    kv_store = (
-        args.omni_kv_config.get("kv_store_config", {})
-        if isinstance(args.omni_kv_config, dict)
-        else {}
-    )
+    kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
 
     enable_offload = kv_store.get("enable_offload", False)
     lmcache_config = kv_store.get("lmcache_config")
@@ -123,9 +117,7 @@ def _map_offload_config(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
             entry = connectors[0]
             args.kv_transfer_config = KVTransferConfig(
                 kv_connector=entry["kv_connector"],
-                kv_connector_extra_config=entry.get(
-                    "kv_connector_extra_config", {}
-                ),
+                kv_connector_extra_config=entry.get("kv_connector_extra_config", {}),
                 kv_role=kv_role,
             )
         else:
