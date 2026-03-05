@@ -66,7 +66,8 @@ def _build_connector_list(kv_store: dict, lmcache_config: dict) -> list[dict]:
             }
         )
 
-    # LMCacheConnectorV1
+    # LMCacheConnectorV1 — always appended; caller guarantees lmcache_config
+    # is non-empty before invoking this function.
     lmcache_extra: dict = {}
     if isinstance(lmcache_config, dict):
         lmcache_extra = lmcache_config.copy()
