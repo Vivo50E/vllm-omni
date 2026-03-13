@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,9 +69,13 @@ def _build_connector_list(kv_store: dict, lmcache_config: dict) -> list[dict]:
 
     # LMCacheConnectorV1 — always appended; caller guarantees lmcache_config
     # is non-empty before invoking this function.
+    # vLLM's connector overlay only applies keys starting with "lmcache.";
+    # prefix user keys so YAML config reaches LMCache.
     lmcache_extra: dict = {}
     if isinstance(lmcache_config, dict):
-        lmcache_extra = lmcache_config.copy()
+        for key, value in lmcache_config.items():
+            prefixed = key if key.startswith("lmcache.") else f"lmcache.{key}"
+            lmcache_extra[prefixed] = value
     connectors.append(
         {
             "kv_connector": "LMCacheConnectorV1",
@@ -106,6 +111,13 @@ def _map_offload_config(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
     lmcache_config = kv_store.get("lmcache_config")
 
     if lmcache_config:
+        # Set LMCACHE_CONFIG_FILE so the connector's
+        # lmcache_get_or_create_config() loads the user's config file.
+        if isinstance(lmcache_config, dict):
+            config_file = lmcache_config.get("config_file")
+            if config_file and isinstance(config_file, str) and config_file.strip():
+                os.environ["LMCACHE_CONFIG_FILE"] = config_file.strip()
+
         # MultiConnector mode: LMCache + optionally OffloadingConnector
         connectors = _build_connector_list(kv_store, lmcache_config)
 

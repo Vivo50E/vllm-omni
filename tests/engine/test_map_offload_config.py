@@ -5,6 +5,8 @@ KV transfer infrastructure (OffloadingConnector, LMCacheConnectorV1,
 MultiConnector).
 """
 
+import os
+
 import pytest
 
 from vllm_omni.engine.arg_utils import (
@@ -27,7 +29,7 @@ class TestBuildConnectorList:
         assert connectors[0]["kv_connector"] == "OffloadingConnector"
         assert connectors[0]["kv_connector_extra_config"]["cpu_bytes_to_use"] == 8.0 * (1 << 30)
         assert connectors[1]["kv_connector"] == "LMCacheConnectorV1"
-        assert connectors[1]["kv_connector_extra_config"]["config_file"] == "/tmp/lmcache.yaml"
+        assert connectors[1]["kv_connector_extra_config"]["lmcache.config_file"] == "/tmp/lmcache.yaml"
 
     def test_lmcache_only(self):
         kv_store = {"enable_offload": False}
@@ -37,7 +39,7 @@ class TestBuildConnectorList:
 
         assert len(connectors) == 1
         assert connectors[0]["kv_connector"] == "LMCacheConnectorV1"
-        assert connectors[0]["kv_connector_extra_config"]["config_file"] == "/tmp/lmcache.yaml"
+        assert connectors[0]["kv_connector_extra_config"]["lmcache.config_file"] == "/tmp/lmcache.yaml"
 
     def test_offload_without_max_cpu_gb(self):
         """Standalone test: verifies default cpu_bytes_to_use when max_cpu_memory_gb
@@ -140,7 +142,7 @@ class TestMapOffloadConfigMultiConnector:
 
         assert args.kv_transfer_config is not None
         assert args.kv_transfer_config.kv_connector == "LMCacheConnectorV1"
-        assert args.kv_transfer_config.kv_connector_extra_config == {"config_file": "/tmp/lmcache.yaml"}
+        assert args.kv_transfer_config.kv_connector_extra_config == {"lmcache.config_file": "/tmp/lmcache.yaml"}
         assert args.kv_transfer_config.kv_role == "kv_both"
         assert args.kv_offloading_size is None
         assert args.disable_hybrid_kv_cache_manager is False
@@ -173,7 +175,7 @@ class TestMapOffloadConfigMultiConnector:
         assert connectors[0]["kv_connector"] == "OffloadingConnector"
         assert connectors[0]["kv_connector_extra_config"]["cpu_bytes_to_use"] == 8.0 * (1 << 30)
         assert connectors[1]["kv_connector"] == "LMCacheConnectorV1"
-        assert connectors[1]["kv_connector_extra_config"]["config_file"] == "/tmp/lmcache.yaml"
+        assert connectors[1]["kv_connector_extra_config"]["lmcache.config_file"] == "/tmp/lmcache.yaml"
 
         # MultiConnector mode does NOT set kv_offloading_size (avoids
         # VllmConfig._post_init_kv_transfer_config overriding kv_connector)
@@ -237,9 +239,9 @@ class TestMapOffloadConfigMultiConnector:
         cfg = args.kv_transfer_config
         assert cfg.kv_connector == "LMCacheConnectorV1"
         assert cfg.kv_role == "kv_both"
-        assert cfg.kv_connector_extra_config["config_file"] == "/tmp/lmcache.yaml"
-        assert cfg.kv_connector_extra_config["chunk_size"] == 256
-        assert cfg.kv_connector_extra_config["max_local_cache_size"] == "10GiB"
+        assert cfg.kv_connector_extra_config["lmcache.config_file"] == "/tmp/lmcache.yaml"
+        assert cfg.kv_connector_extra_config["lmcache.chunk_size"] == 256
+        assert cfg.kv_connector_extra_config["lmcache.max_local_cache_size"] == "10GiB"
 
     def test_custom_kv_role(self):
         """Custom kv_role should be passed to KVTransferConfig."""
@@ -258,3 +260,46 @@ class TestMapOffloadConfigMultiConnector:
             pytest.skip("vLLM not installed, cannot import KVTransferConfig")
 
         assert args.kv_transfer_config.kv_role == "kv_producer"
+
+    def test_lmcache_yaml_config_format_required_by_vllm(self):
+        """Assert the bridge output matches what vLLM's LMCache connector actually uses.
+
+        vLLM behavior (not our implementation) dictates the expected format:
+        - Config file: lmcache_get_or_create_config() in vllm/.../lmcache_integration/utils.py
+          reads only os.environ["LMCACHE_CONFIG_FILE"]; it does not read config_file from
+          kv_connector_extra_config.
+        - Overlay: LMCacheConnectorV1Impl in vllm/.../lmcache_integration/vllm_v1_adapter.py
+          only applies extra_config entries where key.startswith("lmcache.") (line ~593).
+          Unprefixed keys (e.g. config_file, chunk_size) are skipped.
+
+        So the bridge must set LMCACHE_CONFIG_FILE and prefix keys with "lmcache." for
+        user YAML to take effect. This test enforces that contract.
+        """
+        saved = os.environ.get("LMCACHE_CONFIG_FILE")
+        try:
+            args = self._make_args_with_config(
+                {
+                    "kv_store_config": {
+                        "lmcache_config": {
+                            "config_file": "/tmp/mylmcache.yaml",
+                            "chunk_size": 256,
+                        }
+                    }
+                }
+            )
+            try:
+                _map_offload_config(args)
+            except ImportError:
+                pytest.skip("vLLM not installed, cannot import KVTransferConfig")
+
+            extra = args.kv_transfer_config.kv_connector_extra_config
+            assert extra.get("lmcache.config_file") == "/tmp/mylmcache.yaml", (
+                "vLLM only loads config file from LMCACHE_CONFIG_FILE; bridge must set env"
+            )
+            assert extra.get("lmcache.chunk_size") == 256, "vLLM overlay only applies keys with 'lmcache.' prefix"
+            assert os.environ.get("LMCACHE_CONFIG_FILE") == "/tmp/mylmcache.yaml"
+        finally:
+            if saved is not None:
+                os.environ["LMCACHE_CONFIG_FILE"] = saved
+            elif "LMCACHE_CONFIG_FILE" in os.environ:
+                os.environ.pop("LMCACHE_CONFIG_FILE")
