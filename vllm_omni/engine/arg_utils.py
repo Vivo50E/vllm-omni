@@ -87,6 +87,18 @@ def _build_connector_list(kv_store: dict, lmcache_config: dict) -> list[dict]:
     return connectors
 
 
+def _set_lmcache_env(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
+    """Set LMCACHE_CONFIG_FILE env var from omni_kv_config if present."""
+    if not args.omni_kv_config:
+        return
+    kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
+    lmcache_config = kv_store.get("lmcache_config")
+    if isinstance(lmcache_config, dict):
+        config_file = lmcache_config.get("config_file")
+        if config_file and isinstance(config_file, str) and config_file.strip():
+            os.environ["LMCACHE_CONFIG_FILE"] = config_file.strip()
+
+
 def _map_offload_config(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
     """Map omni_kv_config to vLLM's KV transfer infrastructure.
 
@@ -111,13 +123,6 @@ def _map_offload_config(args: "OmniEngineArgs | AsyncOmniEngineArgs") -> None:
     lmcache_config = kv_store.get("lmcache_config")
 
     if lmcache_config:
-        # Set LMCACHE_CONFIG_FILE so the connector's
-        # lmcache_get_or_create_config() loads the user's config file.
-        if isinstance(lmcache_config, dict):
-            config_file = lmcache_config.get("config_file")
-            if config_file and isinstance(config_file, str) and config_file.strip():
-                os.environ["LMCACHE_CONFIG_FILE"] = config_file.strip()
-
         # MultiConnector mode: LMCache + optionally OffloadingConnector
         connectors = _build_connector_list(kv_store, lmcache_config)
 
@@ -205,6 +210,7 @@ class OmniEngineArgs(EngineArgs):
     def __post_init__(self) -> None:
         load_omni_general_plugins()
         _map_offload_config(self)
+        _set_lmcache_env(self)
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):
@@ -366,6 +372,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     def __post_init__(self) -> None:
         load_omni_general_plugins()
         _map_offload_config(self)
+        _set_lmcache_env(self)
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):
