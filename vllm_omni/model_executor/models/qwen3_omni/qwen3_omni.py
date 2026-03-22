@@ -397,7 +397,32 @@ class Qwen3OmniMoeForConditionalGeneration(
             # These will later be projected into talker text space by the talker stage.
             multimodal_outputs = captured_layer_dict if captured_layer_dict is not None else {}
             try:
+                # Debug: Log TTS tokens info before embed_input_ids call
+                logger.debug(
+                    f"[TTS Embed Debug] tts_tokens shape={self.tts_tokens.shape}, "
+                    f"device={self.tts_tokens.device}, values={self.tts_tokens.tolist()}"
+                )
+                # Check vocab_size before calling embed_input_ids
+                if hasattr(self.thinker, 'language_model') and hasattr(self.thinker.language_model, 'model'):
+                    embed_tokens = getattr(self.thinker.language_model.model, 'embed_tokens', None)
+                    if embed_tokens is not None:
+                        vocab_size = embed_tokens.num_embeddings
+                        max_token_id = self.tts_tokens.max().item()
+                        logger.debug(
+                            f"[TTS Embed Debug] embed_tokens vocab_size={vocab_size}, "
+                            f"max_token_id={max_token_id}, in_range={max_token_id < vocab_size}"
+                        )
+                        if max_token_id >= vocab_size:
+                            logger.error(
+                                f"[TTS Embed Error] Token ID {max_token_id} exceeds vocab_size {vocab_size}! "
+                                f"TTS tokens: {self.tts_tokens.tolist()}"
+                            )
+
                 thinker_tts_embeds = self.thinker.embed_input_ids(self.tts_tokens)  # [1,3,thinker_hidden]
+                logger.debug(
+                    f"[TTS Embed Debug] thinker_tts_embeds type={type(thinker_tts_embeds)}, "
+                    f"shape={thinker_tts_embeds.shape if isinstance(thinker_tts_embeds, torch.Tensor) else 'N/A'}"
+                )
                 if (
                     isinstance(thinker_tts_embeds, torch.Tensor)
                     and thinker_tts_embeds.ndim == 3
@@ -407,9 +432,21 @@ class Qwen3OmniMoeForConditionalGeneration(
                     multimodal_outputs["tts_bos_embed"] = [bos_eos_pad[0]]
                     multimodal_outputs["tts_eos_embed"] = [bos_eos_pad[1]]
                     multimodal_outputs["tts_pad_embed"] = [bos_eos_pad[2]]
-            except Exception:
-                # Best-effort; absence will be handled by talker with fallbacks
-                pass
+                    logger.debug("[TTS Embed Debug] Successfully generated TTS embeddings")
+                else:
+                    logger.warning(
+                        f"[TTS Embed Warning] Unexpected thinker_tts_embeds format: "
+                        f"type={type(thinker_tts_embeds)}, "
+                        f"ndim={thinker_tts_embeds.ndim if isinstance(thinker_tts_embeds, torch.Tensor) else 'N/A'}, "
+                        f"shape={thinker_tts_embeds.shape if isinstance(thinker_tts_embeds, torch.Tensor) else 'N/A'}"
+                    )
+            except Exception as e:
+                import traceback
+                logger.error(
+                    f"[TTS Embed Error] Failed to generate TTS embeddings: {type(e).__name__}: {e}\n"
+                    f"tts_tokens={self.tts_tokens.tolist() if hasattr(self, 'tts_tokens') else 'N/A'}\n"
+                    f"Traceback:\n{traceback.format_exc()}"
+                )
 
             # Return text-only output (with multimodal sidecar)
             return OmniOutput(
@@ -690,15 +727,22 @@ class Qwen3OmniMoeForConditionalGeneration(
             else torch.as_tensor(info_dict.get("thinker_input_ids"), device=self._module_device(self.talker))
         )
 
-        tts_bos_thinker = info_dict.get("tts_bos_embed").to(
-            device=self._module_device(self.talker), dtype=torch.bfloat16
-        )
-        tts_eos_thinker = info_dict.get("tts_eos_embed").to(
-            device=self._module_device(self.talker), dtype=torch.bfloat16
-        )
-        tts_pad_thinker = info_dict.get("tts_pad_embed").to(
-            device=self._module_device(self.talker), dtype=torch.bfloat16
-        )
+        # Safely get TTS embeddings from thinker, allowing None for fallback in _get_tts_embed
+        def _safe_to_device(x):
+            if x is not None and isinstance(x, torch.Tensor):
+                return x.to(device=self._module_device(self.talker), dtype=torch.bfloat16)
+            return None
+
+        tts_bos_thinker = _safe_to_device(info_dict.get("tts_bos_embed"))
+        tts_eos_thinker = _safe_to_device(info_dict.get("tts_eos_embed"))
+        tts_pad_thinker = _safe_to_device(info_dict.get("tts_pad_embed"))
+
+        if tts_bos_thinker is None or tts_eos_thinker is None or tts_pad_thinker is None:
+            logger.warning(
+                f"[Talker Fallback] Missing TTS embeddings from thinker: "
+                f"bos={tts_bos_thinker is not None}, eos={tts_eos_thinker is not None}, pad={tts_pad_thinker is not None}. "
+                f"Using zero-tensor fallback."
+            )
 
         if thinker_sequence_embeds is None or thinker_hidden_states is None:
             raise ValueError(
