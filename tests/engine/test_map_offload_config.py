@@ -112,9 +112,7 @@ class TestMapOffloadConfigMultiConnector:
 
     def test_offload_only_default_memory(self):
         """Offload with no max_cpu_memory_gb should default to 10.0."""
-        args = self._make_args_with_config(
-            {"kv_store_config": {"enable_offload": True}}
-        )
+        args = self._make_args_with_config({"kv_store_config": {"enable_offload": True}})
 
         _map_offload_config(args)
 
@@ -139,9 +137,7 @@ class TestMapOffloadConfigMultiConnector:
 
         assert args.kv_transfer_config is not None
         assert args.kv_transfer_config.kv_connector == "LMCacheConnectorV1"
-        assert args.kv_transfer_config.kv_connector_extra_config == {
-            "config_file": "/tmp/lmcache.yaml"
-        }
+        assert args.kv_transfer_config.kv_connector_extra_config == {"config_file": "/tmp/lmcache.yaml"}
         assert args.kv_transfer_config.kv_role == "kv_both"
         assert args.kv_offloading_size is None
         assert args.disable_hybrid_kv_cache_manager is False
