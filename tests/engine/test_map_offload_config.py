@@ -1,7 +1,7 @@
 """Unit tests for OmniEngineArgs._map_offload_config() MultiConnector support.
 
 Tests the config bridge that maps omni_kv_config YAML surface to vLLM's
-KV transfer infrastructure (OffloadingConnector, LMCacheConnector,
+KV transfer infrastructure (OffloadingConnector, LMCacheConnectorV1,
 MultiConnector).
 """
 
@@ -24,10 +24,10 @@ class TestBuildConnectorList:
         connectors = _build_connector_list(kv_store, lmcache_config)
 
         assert len(connectors) == 2
-        assert connectors[0]["connector_class"] == "OffloadingConnector"
-        assert connectors[0]["config"]["max_cpu_memory_gb"] == 8.0
-        assert connectors[1]["connector_class"] == "LMCacheConnector"
-        assert connectors[1]["config"]["config_file"] == "/tmp/lmcache.yaml"
+        assert connectors[0]["kv_connector"] == "OffloadingConnector"
+        assert connectors[0]["kv_connector_extra_config"]["cpu_bytes_to_use"] == 8.0 * (1 << 30)
+        assert connectors[1]["kv_connector"] == "LMCacheConnectorV1"
+        assert connectors[1]["kv_connector_extra_config"]["config_file"] == "/tmp/lmcache.yaml"
 
     def test_lmcache_only(self):
         kv_store = {"enable_offload": False}
@@ -36,8 +36,8 @@ class TestBuildConnectorList:
         connectors = _build_connector_list(kv_store, lmcache_config)
 
         assert len(connectors) == 1
-        assert connectors[0]["connector_class"] == "LMCacheConnector"
-        assert connectors[0]["config"]["config_file"] == "/tmp/lmcache.yaml"
+        assert connectors[0]["kv_connector"] == "LMCacheConnectorV1"
+        assert connectors[0]["kv_connector_extra_config"]["config_file"] == "/tmp/lmcache.yaml"
 
     def test_offload_without_max_cpu_gb(self):
         kv_store = {"enable_offload": True}
@@ -46,9 +46,9 @@ class TestBuildConnectorList:
         connectors = _build_connector_list(kv_store, lmcache_config)
 
         assert len(connectors) == 2
-        assert connectors[0]["connector_class"] == "OffloadingConnector"
-        assert connectors[0]["config"] == {}
-        assert connectors[1]["connector_class"] == "LMCacheConnector"
+        assert connectors[0]["kv_connector"] == "OffloadingConnector"
+        assert connectors[0]["kv_connector_extra_config"]["cpu_bytes_to_use"] == 10.0 * (1 << 30)
+        assert connectors[1]["kv_connector"] == "LMCacheConnectorV1"
 
     def test_lmcache_config_is_copied(self):
         """Ensure lmcache_config dict is copied, not mutated."""
@@ -58,7 +58,7 @@ class TestBuildConnectorList:
         connectors = _build_connector_list(kv_store, lmcache_config)
 
         # Modifying the returned config should not affect the original
-        connectors[0]["config"]["extra_key"] = "value"
+        connectors[0]["kv_connector_extra_config"]["extra_key"] = "value"
         assert "extra_key" not in lmcache_config
 
     def test_no_offload_no_lmcache_in_kv_store(self):
@@ -69,7 +69,7 @@ class TestBuildConnectorList:
         connectors = _build_connector_list(kv_store, lmcache_config)
 
         assert len(connectors) == 1
-        assert connectors[0]["connector_class"] == "LMCacheConnector"
+        assert connectors[0]["kv_connector"] == "LMCacheConnectorV1"
 
 
 class TestMapOffloadConfigMultiConnector:
@@ -138,7 +138,7 @@ class TestMapOffloadConfigMultiConnector:
             pytest.skip("vLLM not installed, cannot import KVTransferConfig")
 
         assert args.kv_transfer_config is not None
-        assert args.kv_transfer_config.kv_connector == "LMCacheConnector"
+        assert args.kv_transfer_config.kv_connector == "LMCacheConnectorV1"
         assert args.kv_transfer_config.kv_connector_extra_config == {
             "config_file": "/tmp/lmcache.yaml"
         }
@@ -171,13 +171,14 @@ class TestMapOffloadConfigMultiConnector:
         assert "connectors" in extra
         connectors = extra["connectors"]
         assert len(connectors) == 2
-        assert connectors[0]["connector_class"] == "OffloadingConnector"
-        assert connectors[0]["config"]["max_cpu_memory_gb"] == 8.0
-        assert connectors[1]["connector_class"] == "LMCacheConnector"
-        assert connectors[1]["config"]["config_file"] == "/tmp/lmcache.yaml"
+        assert connectors[0]["kv_connector"] == "OffloadingConnector"
+        assert connectors[0]["kv_connector_extra_config"]["cpu_bytes_to_use"] == 8.0 * (1 << 30)
+        assert connectors[1]["kv_connector"] == "LMCacheConnectorV1"
+        assert connectors[1]["kv_connector_extra_config"]["config_file"] == "/tmp/lmcache.yaml"
 
-        # Offload also sets kv_offloading_size and disables HMA
-        assert args.kv_offloading_size == 8.0
+        # MultiConnector mode does NOT set kv_offloading_size (avoids
+        # VllmConfig._post_init_kv_transfer_config overriding kv_connector)
+        assert args.kv_offloading_size is None
         assert args.disable_hybrid_kv_cache_manager is True
 
     def test_no_config_is_noop(self):
@@ -235,7 +236,7 @@ class TestMapOffloadConfigMultiConnector:
             pytest.skip("vLLM not installed, cannot import KVTransferConfig")
 
         cfg = args.kv_transfer_config
-        assert cfg.kv_connector == "LMCacheConnector"
+        assert cfg.kv_connector == "LMCacheConnectorV1"
         assert cfg.kv_role == "kv_both"
         assert cfg.kv_connector_extra_config["config_file"] == "/tmp/lmcache.yaml"
         assert cfg.kv_connector_extra_config["chunk_size"] == 256
