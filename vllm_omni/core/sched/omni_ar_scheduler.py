@@ -327,6 +327,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        return omni_output
 
     def update_from_output(
         self,
@@ -744,6 +745,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # active_kv_transfers updates already done before the per-request loop).
         if kv_extracted_ids:
             for req_id in kv_extracted_ids:
+
                 try:
                     if req_id in self.waiting_for_transfer_free:
                         req = self.requests.get(req_id)
