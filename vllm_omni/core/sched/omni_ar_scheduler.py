@@ -237,6 +237,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        return omni_output
 
     def update_from_output(
         self,
@@ -467,21 +468,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # [Omni] Cleanup state for finished requests
         for req in stopped_running_reqs:
-            if req.request_id not in self.waiting_for_transfer_free:
-                if req.request_id in self.transfer_triggered_requests:
-                    self.transfer_triggered_requests.remove(req.request_id)
-                if req.request_id in self.active_kv_transfers:
-                    self.active_kv_transfers.remove(req.request_id)
-                self.pending_stop_after_extraction.discard(req.request_id)
+            rid = req.request_id
+            if rid not in self.waiting_for_transfer_free:
+                self.transfer_triggered_requests.discard(rid)
+                self.active_kv_transfers.discard(rid)
+                self.pending_stop_after_extraction.discard(rid)
 
         # Same for preempted
         for req in stopped_preempted_reqs:
-            if req.request_id not in self.waiting_for_transfer_free:
-                if req.request_id in self.transfer_triggered_requests:
-                    self.transfer_triggered_requests.remove(req.request_id)
-                if req.request_id in self.active_kv_transfers:
-                    self.active_kv_transfers.remove(req.request_id)
-                self.pending_stop_after_extraction.discard(req.request_id)
+            rid = req.request_id
+            if rid not in self.waiting_for_transfer_free:
+                self.transfer_triggered_requests.discard(rid)
+                self.active_kv_transfers.discard(rid)
+                self.pending_stop_after_extraction.discard(rid)
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
@@ -532,6 +531,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # active_kv_transfers updates already done before the per-request loop).
         if kv_extracted_ids:
             for req_id in kv_extracted_ids:
+
                 try:
                     if req_id in self.waiting_for_transfer_free:
                         req = self.requests.get(req_id)
