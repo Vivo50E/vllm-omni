@@ -83,6 +83,98 @@ def register_omni_models_to_vllm():
             ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
 
+def _build_connector_list(kv_store: dict, lmcache_config: dict) -> list[dict]:
+    """Build the connector list for MultiConnector from omni_kv_config."""
+    connectors: list[dict] = []
+
+    # OffloadingConnector (if offload is enabled)
+    if kv_store.get("enable_offload"):
+        max_cpu_gb = kv_store.get("max_cpu_memory_gb", 10.0)
+        connectors.append(
+            {
+                "kv_connector": "OffloadingConnector",
+                "kv_role": "kv_both",
+                "kv_connector_extra_config": {
+                    "cpu_bytes_to_use": max_cpu_gb * (1 << 30),
+                },
+            }
+        )
+
+    # LMCacheConnectorV1
+    lmcache_extra: dict = {}
+    if isinstance(lmcache_config, dict):
+        for key, value in lmcache_config.items():
+            prefixed = key if key.startswith("lmcache.") else f"lmcache.{key}"
+            lmcache_extra[prefixed] = value
+    connectors.append(
+        {
+            "kv_connector": "LMCacheConnectorV1",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": lmcache_extra,
+        }
+    )
+
+    return connectors
+
+
+def _set_lmcache_env(args: "OmniEngineArgs") -> None:
+    """Set LMCACHE_CONFIG_FILE env var from omni_kv_config if present."""
+    if not args.omni_kv_config:
+        return
+    kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
+    lmcache_config = kv_store.get("lmcache_config")
+    if isinstance(lmcache_config, dict):
+        config_file = lmcache_config.get("config_file")
+        if config_file and isinstance(config_file, str) and config_file.strip():
+            os.environ["LMCACHE_CONFIG_FILE"] = config_file.strip()
+
+
+def _map_offload_config(args: "OmniEngineArgs") -> None:
+    """Map omni_kv_config to vLLM's KV transfer infrastructure."""
+    if not args.omni_kv_config:
+        return
+    kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
+
+    enable_offload = kv_store.get("enable_offload", False)
+    lmcache_config = kv_store.get("lmcache_config")
+
+    if lmcache_config:
+        # MultiConnector mode: LMCache + optionally OffloadingConnector
+        connectors = _build_connector_list(kv_store, lmcache_config)
+
+        from vllm.config.kv_transfer import KVTransferConfig
+
+        kv_role = kv_store.get("kv_role", "kv_both")
+
+        if len(connectors) == 1:
+            entry = connectors[0]
+            args.kv_transfer_config = KVTransferConfig(
+                kv_connector=entry["kv_connector"],
+                kv_connector_extra_config=entry.get("kv_connector_extra_config", {}),
+                kv_role=kv_role,
+            )
+        else:
+            args.kv_transfer_config = KVTransferConfig(
+                kv_connector="MultiConnector",
+                kv_connector_extra_config={"connectors": connectors},
+                kv_role=kv_role,
+            )
+
+        if enable_offload:
+            args.disable_hybrid_kv_cache_manager = True
+
+        logger.info(
+            "[Omni] kv_transfer_config: kv_connector=%s, connectors=%s",
+            args.kv_transfer_config.kv_connector,
+            [c["kv_connector"] for c in connectors],
+        )
+
+    elif enable_offload and args.kv_offloading_size is None:
+        # Simple offload mode
+        args.kv_offloading_size = kv_store.get("max_cpu_memory_gb", 10.0)
+        args.disable_hybrid_kv_cache_manager = True
+
+
 @dataclass
 class OmniEngineArgs(EngineArgs):
     """Engine arguments for omni models, extending base EngineArgs.
@@ -175,6 +267,8 @@ class OmniEngineArgs(EngineArgs):
             elif self.worker_type == "generation":
                 self.worker_cls = current_omni_platform.get_omni_generation_worker_cls()
         load_omni_general_plugins()
+        _map_offload_config(self)
+        _set_lmcache_env(self)
         super().__post_init__()
 
     @classmethod
