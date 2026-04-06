@@ -40,6 +40,9 @@ class TestBuildConnectorList:
         assert connectors[0]["kv_connector_extra_config"]["config_file"] == "/tmp/lmcache.yaml"
 
     def test_offload_without_max_cpu_gb(self):
+        """Standalone test: verifies default cpu_bytes_to_use when max_cpu_memory_gb
+        is omitted. Note: _map_offload_config guards with `if lmcache_config:`
+        so this exact call (empty lmcache_config) won't happen in practice."""
         kv_store = {"enable_offload": True}
         lmcache_config = {}
 
