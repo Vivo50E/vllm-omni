@@ -13,6 +13,7 @@ from vllm_omni.engine.arg_utils import (
     OmniEngineArgs,
     _build_connector_list,
     _map_offload_config,
+    _set_lmcache_env,
 )
 
 
@@ -291,6 +292,7 @@ class TestMapOffloadConfigMultiConnector:
                 _map_offload_config(args)
             except ImportError:
                 pytest.skip("vLLM not installed, cannot import KVTransferConfig")
+            _set_lmcache_env(args)
 
             extra = args.kv_transfer_config.kv_connector_extra_config
             assert extra.get("lmcache.config_file") == "/tmp/mylmcache.yaml", (
