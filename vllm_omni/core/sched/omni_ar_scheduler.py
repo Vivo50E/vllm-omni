@@ -327,7 +327,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
-        return omni_output
 
     def update_from_output(
         self,
