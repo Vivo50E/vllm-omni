@@ -324,7 +324,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
 
-
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
@@ -509,6 +508,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # Restore HS from LMCache after KV load (start_load_kv already ran)
+            self._maybe_restore_hs_from_lmcache(scheduler_output)
+
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -542,6 +544,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 multimodal_outputs=multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
+            )
+
+            # Store multimodal HS (layers "0", "24") + last layer to LMCache
+            self._maybe_store_hs_to_lmcache(
+                hidden_states,
+                multimodal_outputs,
+                num_tokens_unpadded,
+                scheduler_output,
             )
 
             if not self.broadcast_pp_output:
@@ -881,7 +891,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 start,
                 end,
             )
-            payload: dict[str, object] = {"hidden": req_hidden_states}
 
             mm_payload: dict[str, object] = {}
             if combined_multimodal_outputs or mm_cpu:
@@ -909,7 +918,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                             pass_lists_through=False,
                             seq_len=seq_len,
                         )
-                payload.update(mm_payload)
+
+            # Prepend restored per-layer HS from LMCache (for KV restore path)
+            restored_mm = getattr(self, "_restored_mm", None)
+            if restored_mm and rid in restored_mm:
+                for layer_key, prefix_tensor in restored_mm.pop(rid).items():
+                    if layer_key == "hidden":
+                        req_hidden_states = torch.cat([prefix_tensor, req_hidden_states], dim=0)
+                    else:
+                        current = mm_payload.get(layer_key)
+                        if current is not None and isinstance(current, torch.Tensor):
+                            mm_payload[layer_key] = torch.cat([prefix_tensor, current], dim=0)
+                        else:
+                            mm_payload[layer_key] = prefix_tensor
+
+            payload: dict[str, object] = {"hidden": req_hidden_states}
+            payload.update(mm_payload)
             pooler_output.append(payload)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:

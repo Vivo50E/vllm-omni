@@ -47,6 +47,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
+        self._has_lmcache = False
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
         """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.
@@ -83,6 +84,145 @@ class OmniGPUModelRunner(GPUModelRunner):
                 hidden_size=self.model_config.get_hidden_size(),
                 hs_dtype=self.dtype,
             )
+
+        omni_kv = getattr(self.model_config, "omni_kv_config", None)
+        self._has_lmcache = isinstance(omni_kv, dict) and "kv_store_config" in omni_kv
+        if self._has_lmcache:
+            logger.info("LMCache hidden state store/restore enabled")
+
+    def _get_lmcache_adapter(self):
+        """Lazily find the LMCacheConnectorV1Impl adapter from the KV connector."""
+        cached = getattr(self, "_lmcache_adapter_cached", None)
+        if cached is not None:
+            return cached
+        try:
+            from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+
+            if not has_kv_transfer_group():
+                return None
+            connector = get_kv_transfer_group()
+            # MultiConnector: search sub-connectors
+            if hasattr(connector, "_connectors"):
+                for c in connector._connectors:
+                    impl = getattr(c, "_lmcache_engine", None)
+                    if impl is not None and hasattr(impl, "lmcache_engine"):
+                        self._lmcache_adapter_cached = impl
+                        return impl
+            # Direct LMCacheConnectorV1
+            impl = getattr(connector, "_lmcache_engine", None)
+            if impl is not None and hasattr(impl, "lmcache_engine"):
+                self._lmcache_adapter_cached = impl
+                return impl
+        except Exception:
+            pass
+        return None
+
+    # Layer keys stored to LMCache: "0" (embeddings), "24" (accept_hidden_layer),
+    # "hidden" (last transformer layer).
+    _HS_LAYER_KEYS = ("0", "24", "hidden")
+
+    def _maybe_store_hs_to_lmcache(
+        self,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: dict | None,
+        num_tokens_unpadded: int,
+        scheduler_output,
+    ):
+        """Store per-layer hidden states to LMCache alongside KV cache."""
+        if not self._has_lmcache:
+            return
+        adapter = self._get_lmcache_adapter()
+        if adapter is None or not hasattr(adapter, "lmcache_engine"):
+            return
+        engine = adapter.lmcache_engine
+        if engine is None:
+            return
+
+        # Build {layer_key: gpu_tensor} for all layers to store
+        layers_to_store: dict[str, torch.Tensor] = {}
+        if multimodal_outputs:
+            for key in ("0", "24"):
+                t = multimodal_outputs.get(key)
+                if t is not None and isinstance(t, torch.Tensor):
+                    layers_to_store[key] = t
+        if isinstance(hidden_states, torch.Tensor):
+            layers_to_store["hidden"] = hidden_states
+
+        if not layers_to_store:
+            return
+
+        for layer_key, tensor in layers_to_store.items():
+            hs_cpu = tensor[:num_tokens_unpadded].detach().to("cpu").contiguous()
+            for req_id in self.input_batch.req_ids:
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                sched = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                if sched <= 0:
+                    continue
+                start = int(self.query_start_loc.cpu[req_idx])
+                req_hs = hs_cpu[start : start + sched]
+                num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                total_tokens = num_computed + sched
+                token_ids = self.input_batch.token_ids_cpu[req_idx, :total_tokens].tolist()
+                hs_token_ids = [hash(layer_key)] + token_ids
+                try:
+                    engine.store_hidden_states(hs_token_ids, hidden_states=req_hs)
+                except Exception:
+                    pass
+
+    def _maybe_restore_hs_from_lmcache(self, scheduler_output=None):
+        """Restore per-layer hidden states from LMCache.
+
+        Checks new requests with ``num_computed_tokens > 0`` (KV cache hit)
+        and retrieves layers "0" and "24" from LMCache.  Stashes results
+        in ``_restored_mm`` for ``sample_tokens`` to prepend into mm_payload.
+        """
+        if not self._has_lmcache or scheduler_output is None:
+            return
+        adapter = self._get_lmcache_adapter()
+        if adapter is None or not hasattr(adapter, "lmcache_engine"):
+            return
+        engine = adapter.lmcache_engine
+        if engine is None:
+            return
+
+        self._restored_mm: dict[str, dict[str, torch.Tensor]] = {}
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.num_computed_tokens <= 0:
+                continue
+            req_id = new_req.req_id
+            req_idx = self.input_batch.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            num_computed = new_req.num_computed_tokens
+            token_ids = self.input_batch.token_ids_cpu[req_idx, :num_computed].tolist()
+
+            layers: dict[str, torch.Tensor] = {}
+            for layer_key in self._HS_LAYER_KEYS:
+                hs_token_ids = [hash(layer_key)] + token_ids
+                hs = engine.retrieve_hidden_states(hs_token_ids)
+                if hs is not None:
+                    layers[layer_key] = hs
+
+            if layers:
+                self._restored_mm[req_id] = layers
+                # Write into prefix cache slots if available
+                if self.omni_prefix_cache is not None:
+                    slot_mapping = self.input_batch.block_table[0].slot_mapping.cpu
+                    for layer_key, hs in layers.items():
+                        if layer_key == "hidden":
+                            flat = self.omni_prefix_cache.hidden_states_cache.view(
+                                -1,
+                                self.omni_prefix_cache.hidden_states_cache.shape[-1],
+                            )
+                        elif layer_key in self.omni_prefix_cache.mm_outputs_cache:
+                            flat = self.omni_prefix_cache.mm_outputs_cache[layer_key].view(
+                                -1,
+                                self.omni_prefix_cache.mm_outputs_cache[layer_key].shape[-1],
+                            )
+                        else:
+                            continue
+                        n = min(len(hs), len(slot_mapping))
+                        flat[slot_mapping[:n]] = hs[:n]
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
