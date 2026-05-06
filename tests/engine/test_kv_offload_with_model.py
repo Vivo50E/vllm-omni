@@ -1,26 +1,16 @@
 """
 E2E test: verify MultiConnector (OffloadingConnector + LMCacheConnector) works
 with a real model via the omni_kv_config YAML surface.
-
-Usage:
-    # Default: Qwen2.5-Omni-3B, offload only
-    python tests/engine/test_kv_offload_with_model.py
-
-    # Offload + LMCache (requires lmcache installed)
-    python tests/engine/test_kv_offload_with_model.py --mode offload+lmcache
-
-    # Custom model
-    python tests/engine/test_kv_offload_with_model.py --model Qwen/Qwen2.5-Omni-3B
 """
 
-import argparse
-import logging
 import tempfile
 
+import pytest
 import yaml
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-logger = logging.getLogger("multi_connector_test")
+pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
+
+DEFAULT_MODEL = "Qwen/Qwen2.5-Omni-3B"
 
 MODES = {
     "offload": {
@@ -46,6 +36,8 @@ MODES = {
         }
     },
 }
+
+LMCACHE_MODES = {"lmcache", "offload+lmcache"}
 
 
 def build_stage_config(model: str, mode: str) -> str:
@@ -93,23 +85,13 @@ def build_stage_config(model: str, mode: str) -> str:
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
     yaml.dump(config, tmp, default_flow_style=False)
     tmp.flush()
-    logger.info("Stage config written to %s", tmp.name)
-    logger.info("Mode: %s | omni_kv_config: %s", mode, omni_kv_config)
     return tmp.name
 
 
-def run_test(model: str, mode: str, num_prompts: int):
+def _run(model: str, mode: str, num_prompts: int = 3) -> bool:
     from vllm_omni.entrypoints.omni import Omni
 
     config_path = build_stage_config(model, mode)
-
-    logger.info("=" * 60)
-    logger.info("Model      : %s", model)
-    logger.info("Mode       : %s", mode)
-    logger.info("Num prompts: %d", num_prompts)
-    logger.info("=" * 60)
-
-    logger.info("Starting Omni engine...")
     omni = Omni(
         model=model,
         stage_configs_path=config_path,
@@ -123,39 +105,19 @@ def run_test(model: str, mode: str, num_prompts: int):
         {"prompt": f"<|im_start|>user\nCount from 1 to {i + 5}.<|im_end|>\n<|im_start|>assistant\n"}
         for i in range(num_prompts)
     ]
-    sampling_params_list = [st.default_sampling_params for st in omni.stage_list]
-
-    logger.info("Sending %d prompts...", num_prompts)
+    sampling_params_list = omni.default_sampling_params_list
     outputs = omni.generate(prompts, sampling_params_list)
-
-    logger.info("-" * 60)
-    logger.info("RESULTS")
-    logger.info("-" * 60)
-    ok = False
-    for out in outputs:
-        if out.final_output_type == "text" and out.request_output:
-            for ro in out.request_output:
-                text = ro.outputs[0].text if ro.outputs else "(empty)"
-                logger.info("  [%s] %s", ro.request_id, text[:120])
-                if text.strip():
-                    ok = True
-
-    if ok:
-        logger.info("PASS: Got non-empty text output")
-    else:
-        logger.error("FAIL: No text output generated")
-
     omni.close()
-    logger.info("Done!")
-    return ok
+
+    return any(
+        out.request_output and out.request_output.outputs and out.request_output.outputs[0].text.strip()
+        for out in outputs
+        if out.final_output_type == "text"
+    )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test MultiConnector with a real model")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-Omni-3B", help="Model name or path")
-    parser.add_argument("--mode", default="offload", choices=list(MODES.keys()), help="KV config mode")
-    parser.add_argument("--num-prompts", type=int, default=3, help="Number of prompts to send")
-    args = parser.parse_args()
-
-    success = run_test(args.model, args.mode, args.num_prompts)
-    exit(0 if success else 1)
+@pytest.mark.parametrize("mode", list(MODES.keys()))
+def test_kv_offload_modes(mode):
+    if mode in LMCACHE_MODES:
+        pytest.importorskip("lmcache", reason="lmcache not installed")
+    assert _run(DEFAULT_MODEL, mode), f"No text output for mode={mode}"
