@@ -15,6 +15,8 @@ from vllm_omni.engine.arg_utils import (
     _set_lmcache_env,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class TestBuildLmcacheConnectorConfig:
     """Test _build_lmcache_connector_config() helper."""
