@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -37,6 +38,12 @@ else:
     )
 
 logger = init_logger(__name__)
+
+# LMCache HS mirroring: multimodal hook names + synthetic "hidden" slot.
+# layer_idx is the position in this tuple (mm keys 0..n-1, "hidden" last).
+_LMCACHE_HS_MM_KEYS: tuple[str, ...] = ("0", "24")
+_LMCACHE_HS_LAYER_KEYS: tuple[str, ...] = (*_LMCACHE_HS_MM_KEYS, "hidden")
+_LMCACHE_HS_LAYER_IDX: dict[str, int] = {k: i for i, k in enumerate(_LMCACHE_HS_LAYER_KEYS)}
 
 
 class OmniGPUModelRunner(GPUModelRunner):
@@ -89,7 +96,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         omni_kv = getattr(self.model_config, "omni_kv_config", None)
         self._has_lmcache = isinstance(omni_kv, dict) and "kv_store_config" in omni_kv
         if self._has_lmcache:
-            logger.info("LMCache hidden state store/restore enabled")
+            logger.info(
+                "LMCache hidden state store/restore enabled (mm_keys=%s)",
+                _LMCACHE_HS_MM_KEYS,
+            )
 
     def _get_lmcache_adapter(self):
         """Lazily find the LMCacheConnectorV1Impl adapter from the KV connector."""
@@ -118,10 +128,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             pass
         return None
 
-    # Layer keys stored to LMCache: "0" (embeddings), "24" (accept_hidden_layer),
-    # "hidden" (last transformer layer).
-    _HS_LAYER_KEYS = ("0", "24", "hidden")
-
     def _maybe_store_hs_to_lmcache(
         self,
         hidden_states: torch.Tensor,
@@ -138,11 +144,14 @@ class OmniGPUModelRunner(GPUModelRunner):
         engine = adapter.lmcache_engine
         if engine is None:
             return
+        hs_store = engine.hidden_state_store
+        if hs_store is None:
+            return
 
-        # Build {layer_key: gpu_tensor} for all layers to store
+        # Build {layer_key: gpu_tensor}; chunk keys align with KV.
         layers_to_store: dict[str, torch.Tensor] = {}
         if multimodal_outputs:
-            for key in ("0", "24"):
+            for key in _LMCACHE_HS_MM_KEYS:
                 t = multimodal_outputs.get(key)
                 if t is not None and isinstance(t, torch.Tensor):
                     layers_to_store[key] = t
@@ -153,6 +162,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
 
         for layer_key, tensor in layers_to_store.items():
+            layer_idx = _LMCACHE_HS_LAYER_IDX.get(layer_key)
+            if layer_idx is None:
+                continue
             hs_cpu = tensor[:num_tokens_unpadded].detach().to("cpu").contiguous()
             for req_id in self.input_batch.req_ids:
                 req_idx = self.input_batch.req_id_to_index[req_id]
@@ -162,20 +174,19 @@ class OmniGPUModelRunner(GPUModelRunner):
                 start = int(self.query_start_loc.cpu[req_idx])
                 req_hs = hs_cpu[start : start + sched]
                 num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
-                total_tokens = num_computed + sched
-                token_ids = self.input_batch.token_ids_cpu[req_idx, :total_tokens].tolist()
-                hs_token_ids = [hash(layer_key)] + token_ids
+                seg_token_ids = self.input_batch.token_ids_cpu[req_idx, : num_computed + sched].tolist()
                 try:
-                    engine.store_hidden_states(hs_token_ids, hidden_states=req_hs)
+                    hs_store.store_hidden_states(seg_token_ids, req_hs, layer_idx=layer_idx)
                 except Exception:
                     pass
 
     def _maybe_restore_hs_from_lmcache(self, scheduler_output=None):
         """Restore per-layer hidden states from LMCache.
 
-        Checks new requests with ``num_computed_tokens > 0`` (KV cache hit)
-        and retrieves layers "0" and "24" from LMCache.  Stashes results
-        in ``_restored_mm`` for ``sample_tokens`` to prepend into mm_payload.
+        For new requests with a KV-cache hit (``num_computed_tokens > 0``),
+        retrieves mm keys + ``"hidden"`` using the same token prefix as KV
+        (chunk keys align). Stashes into ``_restored_mm`` for ``sample_tokens``
+        to prepend into mm_payload.
         """
         if not self._has_lmcache or scheduler_output is None:
             return
@@ -184,6 +195,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
         engine = adapter.lmcache_engine
         if engine is None:
+            return
+        hs_store = engine.hidden_state_store
+        if hs_store is None:
             return
 
         self._restored_mm: dict[str, dict[str, torch.Tensor]] = {}
@@ -195,16 +209,42 @@ class OmniGPUModelRunner(GPUModelRunner):
             if req_idx is None:
                 continue
             num_computed = new_req.num_computed_tokens
-            token_ids = self.input_batch.token_ids_cpu[req_idx, :num_computed].tolist()
+            chunk_sz = int(getattr(engine.config, "chunk_size", None) or 256)
+            prompt_tokens = int(self.input_batch.num_prompt_tokens[req_idx])
+            # HS chunks follow LMCache KV chunk boundaries. Retrieving with a
+            # length that ends mid-chunk produces different CacheEngineKeys than
+            # offload and yields misses; round up to the next full chunk (capped
+            # by the scheduled prompt) then slice rows back to num_computed.
+            aligned_up = ((num_computed + chunk_sz - 1) // chunk_sz) * chunk_sz
+            retrieve_len = min(prompt_tokens, aligned_up)
+            if retrieve_len <= 0:
+                continue
+            lookup_ids = self.input_batch.token_ids_cpu[req_idx, :retrieve_len].tolist()
 
             layers: dict[str, torch.Tensor] = {}
-            for layer_key in self._HS_LAYER_KEYS:
-                hs_token_ids = [hash(layer_key)] + token_ids
-                hs = engine.retrieve_hidden_states(hs_token_ids)
+            for layer_key in _LMCACHE_HS_LAYER_KEYS:
+                layer_idx = _LMCACHE_HS_LAYER_IDX[layer_key]
+                hs = hs_store.retrieve_hidden_states(lookup_ids, layer_idx=layer_idx)
                 if hs is not None:
+                    if hs.shape[0] > num_computed:
+                        hs = hs[:num_computed]
                     layers[layer_key] = hs
 
             if layers:
+                logger.info(
+                    "LMCache: restored hidden states from cache (req_id=%s, num_prefix_tokens=%d, layer_keys=%s)",
+                    req_id,
+                    num_computed,
+                    list(layers.keys()),
+                )
+                # Optional hook for E2E tests (worker subprocess inherits env).
+                marker_path = os.environ.get("OMNI_HS_RESTORE_MARKER_PATH")
+                if marker_path:
+                    try:
+                        with open(marker_path, "a", encoding="utf-8") as fp:
+                            fp.write(f"{req_id}\t{num_computed}\t{','.join(sorted(layers.keys()))}\n")
+                    except OSError:
+                        pass
                 self._restored_mm[req_id] = layers
                 # Write into prefix cache slots if available
                 if self.omni_prefix_cache is not None:
@@ -222,8 +262,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                             )
                         else:
                             continue
-                        n = min(len(hs), len(slot_mapping))
-                        flat[slot_mapping[:n]] = hs[:n]
+                        n = min(int(hs.shape[0]), int(slot_mapping.shape[0]))
+                        idx = slot_mapping[:n].to(flat.device, non_blocking=True)
+                        flat[idx] = hs[:n].to(device=flat.device, dtype=flat.dtype, non_blocking=True)
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
