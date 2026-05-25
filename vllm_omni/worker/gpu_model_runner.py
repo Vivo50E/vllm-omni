@@ -269,7 +269,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
                 seg_token_ids = self.input_batch.token_ids_cpu[req_idx, : num_computed + sched].tolist()
                 try:
-                    hs_store.store_hidden_states(seg_token_ids, req_hs, layer_idx=layer_idx)
+                    hs_store.store_hidden_states(seg_token_ids, req_hs, layer_idx=layer_idx, token_offset=num_computed)
                 except Exception:
                     pass
 
