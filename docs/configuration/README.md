@@ -17,6 +17,7 @@ For introduction, please check [Introduction for stage config](./stage_configs.m
 ## Multi-Stage Recipes
 
 - **[Prefill-Decode Disaggregation](./pd_disaggregation.md)** - How to derive a PD-aware Qwen3-Omni stage config from the default config without introducing another bundled YAML
+- **[KV Cache Offload (Thinker AR)](./kv_offload.md)** - CPU offload via LMCache with hidden-state roundtrip
 
 ## Optimization Features
 
