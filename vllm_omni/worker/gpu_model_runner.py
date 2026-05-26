@@ -314,10 +314,23 @@ class OmniGPUModelRunner(GPUModelRunner):
             for layer_key in _LMCACHE_HS_LAYER_KEYS:
                 layer_idx = _LMCACHE_HS_LAYER_IDX[layer_key]
                 hs = hs_store.retrieve_hidden_states(lookup_ids, layer_idx=layer_idx)
-                if hs is not None:
-                    if hs.shape[0] > num_computed:
-                        hs = hs[:num_computed]
-                    layers[layer_key] = hs
+                if hs is None:
+                    continue
+                # HS pool may LRU-evict independently of KV; skip layers whose
+                # cached prefix is shorter than what KV restored to avoid
+                # writing incomplete HS into prefix_cache.
+                if hs.shape[0] < num_computed:
+                    logger.warning(
+                        "LMCache: partial HS for req_id=%s layer=%s (got %d < num_computed %d), skipping",
+                        req_id,
+                        layer_key,
+                        int(hs.shape[0]),
+                        num_computed,
+                    )
+                    continue
+                if hs.shape[0] > num_computed:
+                    hs = hs[:num_computed]
+                layers[layer_key] = hs
 
             if layers:
                 logger.info(
