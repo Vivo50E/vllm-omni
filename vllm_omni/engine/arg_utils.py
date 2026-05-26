@@ -111,6 +111,9 @@ def _build_lmcache_connector_config(lmcache_config: dict) -> dict:
         for key, value in lmcache_config.items():
             prefixed = key if key.startswith("lmcache.") else f"lmcache.{key}"
             lmcache_extra[prefixed] = value
+    # Omni stages need hidden states alongside KV; enable by default so the
+    # HiddenStateStore is created. User can override via lmcache_config.
+    lmcache_extra.setdefault("lmcache.enable_hidden_state_cache", True)
     return {
         "kv_connector": "LMCacheConnectorV1",
         "kv_role": "kv_both",
