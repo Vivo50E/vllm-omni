@@ -1,6 +1,6 @@
 """
-E2E test: verify MultiConnector (OffloadingConnector + LMCacheConnector) works
-with a real model via the omni_kv_config YAML surface.
+E2E test: verify LMCacheConnectorV1 works with a real model via the
+omni_kv_config YAML surface.
 """
 
 import tempfile
@@ -13,12 +13,6 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
 DEFAULT_MODEL = "Qwen/Qwen2.5-Omni-3B"
 
 MODES = {
-    "offload": {
-        "kv_store_config": {
-            "enable_offload": True,
-            "max_cpu_memory_gb": 2.0,
-        }
-    },
     "lmcache": {
         "kv_store_config": {
             "lmcache_config": {
@@ -26,18 +20,7 @@ MODES = {
             }
         }
     },
-    "offload+lmcache": {
-        "kv_store_config": {
-            "enable_offload": True,
-            "max_cpu_memory_gb": 2.0,
-            "lmcache_config": {
-                "config_file": "",
-            },
-        }
-    },
 }
-
-LMCACHE_MODES = {"lmcache", "offload+lmcache"}
 
 
 def build_stage_config(model: str, mode: str) -> str:
@@ -118,6 +101,5 @@ def _run(model: str, mode: str, num_prompts: int = 3) -> bool:
 
 @pytest.mark.parametrize("mode", list(MODES.keys()))
 def test_kv_offload_modes(mode):
-    if mode in LMCACHE_MODES:
-        pytest.importorskip("lmcache", reason="lmcache not installed")
+    pytest.importorskip("lmcache", reason="lmcache not installed")
     assert _run(DEFAULT_MODEL, mode), f"No text output for mode={mode}"
