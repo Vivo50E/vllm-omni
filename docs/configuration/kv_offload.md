@@ -23,17 +23,16 @@ cached prefix.
 
 ## Configuration surface
 
-All options live on the **per-stage** `engine_args.omni_kv_config`:
+All options live on the **per-stage** `omni_kv_config` field:
 
 ```yaml
-engine_args:
-  omni_kv_config:
-    kv_store_config:
-      lmcache_config:
-        config_file: ""               # "" -> LMCache defaults
-                                      # path -> exported as LMCACHE_CONFIG_FILE
-        # Any other key here is forwarded to LMCache as lmcache.<key>.
-        # Example: max_local_cpu_size: 4.0
+omni_kv_config:
+  kv_store_config:
+    lmcache_config:
+      config_file: ""               # "" -> LMCache defaults
+                                    # path -> exported as LMCACHE_CONFIG_FILE
+      # Any other key here is forwarded to LMCache as lmcache.<key>.
+      # Example: max_local_cpu_size: 4.0
 ```
 
 `lmcache.enable_hidden_state_cache` is forced on automatically whenever
@@ -42,26 +41,19 @@ a manual flag.
 
 ## Usage
 
-Start from the [default Qwen2.5-Omni stage config](gh-file:vllm_omni/deploy/qwen2_5_omni.yaml)
-and add the LMCache block to the thinker stage. Disable the in-GPU prefix
-cache on the same stage (LMCache manages prefix-keyed CPU storage of its
-own):
+Override the thinker stage in the
+[default Qwen2.5-Omni deploy config](gh-file:vllm_omni/deploy/qwen2_5_omni.yaml).
+Add the LMCache block and disable in-GPU prefix caching on the same stage
+(LMCache manages prefix-keyed CPU storage of its own):
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
-    engine_args:
-      model_stage: thinker
-      model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_type: ar
-      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      enforce_eager: true
-      trust_remote_code: true
-      enable_prefix_caching: false
-      omni_kv_config:
-        kv_store_config:
-          lmcache_config:
-            config_file: ""    # or /path/to/lmcache.yaml
+    enable_prefix_caching: false
+    omni_kv_config:
+      kv_store_config:
+        lmcache_config:
+          config_file: ""    # or /path/to/lmcache.yaml
 ```
 
 ```bash
