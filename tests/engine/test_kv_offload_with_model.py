@@ -28,29 +28,19 @@ def build_stage_config(model: str, mode: str) -> str:
     omni_kv_config = MODES[mode]
 
     config = {
-        "stage_args": [
+        "stages": [
             {
                 "stage_id": 0,
-                "runtime": {"process": True, "devices": "0", "max_batch_size": 1},
-                "engine_args": {
-                    "model_stage": "thinker",
-                    "model_arch": "Qwen2_5OmniForConditionalGeneration",
-                    "worker_type": "ar",
-                    "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
-                    "max_model_len": 512,
-                    "max_num_batched_tokens": 512,
-                    "max_num_seqs": 4,
-                    "gpu_memory_utilization": 0.8,
-                    "skip_mm_profiling": True,
-                    "enforce_eager": True,
-                    "trust_remote_code": True,
-                    "engine_output_type": "text",
-                    "enable_prefix_caching": False,
-                    "omni_kv_config": omni_kv_config,
-                },
-                "is_comprehension": True,
-                "final_output": True,
-                "final_output_type": "text",
+                "max_model_len": 512,
+                "max_num_batched_tokens": 512,
+                "max_num_seqs": 4,
+                "gpu_memory_utilization": 0.8,
+                "skip_mm_profiling": True,
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "enable_prefix_caching": False,
+                "devices": "0",
+                "omni_kv_config": omni_kv_config,
                 "default_sampling_params": {
                     "temperature": 0.0,
                     "max_tokens": 64,
@@ -58,11 +48,6 @@ def build_stage_config(model: str, mode: str) -> str:
                 },
             }
         ],
-        "runtime": {
-            "enabled": True,
-            "defaults": {"window_size": -1, "max_inflight": 1},
-            "edges": [],
-        },
     }
 
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
