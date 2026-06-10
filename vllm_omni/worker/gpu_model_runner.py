@@ -50,11 +50,16 @@ else:
 
 logger = init_logger(__name__)
 
-# LMCache HS mirroring: multimodal hook names + synthetic "hidden" slot.
-# layer_idx is the position in this tuple (mm keys 0..n-1, "hidden" last).
-_LMCACHE_HS_MM_KEYS: tuple[str, ...] = ("0", "24")
-_LMCACHE_HS_LAYER_KEYS: tuple[str, ...] = (*_LMCACHE_HS_MM_KEYS, "hidden")
-_LMCACHE_HS_LAYER_IDX: dict[str, int] = {k: i for i, k in enumerate(_LMCACHE_HS_LAYER_KEYS)}
+# Sentinel layer_idx for the synthetic "hidden" tap (model's final hidden states).
+# Real layer keys are int-coercible strings ("0", "24") and map to layer_idx=int(key);
+# making layer_idx canonical means LMCache's hidden_state_layers allowlist filters
+# by actual layer numbers and adding/removing taps does not shift existing indices.
+_LMCACHE_HS_HIDDEN_LAYER_IDX: int = -1
+
+
+def _hs_layer_idx(layer_key: str) -> int:
+    """Map a layer_key to the canonical LMCache layer_idx."""
+    return _LMCACHE_HS_HIDDEN_LAYER_IDX if layer_key == "hidden" else int(layer_key)
 
 
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -93,6 +98,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
         self._has_lmcache = False
+        # Multimodal layer keys to mirror into LMCache (e.g. ("0", "24") for
+        # Qwen3-Omni; empty for models like Qwen2.5-Omni that only condition on
+        # the final hidden states). Populated in initialize_metadata_builders
+        # from the talker config when LMCache is enabled.
+        self._lmcache_hs_mm_keys: tuple[str, ...] = ()
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -186,9 +196,19 @@ class OmniGPUModelRunner(GPUModelRunner):
         omni_kv = getattr(self.model_config, "omni_kv_config", None)
         self._has_lmcache = isinstance(omni_kv, dict) and "kv_store_config" in omni_kv
         if self._has_lmcache:
+            # Discover the multimodal layer captures the thinker exposes via its
+            # talker config so the runner mirrors the same set into LMCache.
+            # Qwen3-Omni captures layer 0 (word embeddings) + accept_hidden_layer
+            # (the talker conditioning tap); Qwen2.5-Omni has no such captures,
+            # leaving _lmcache_hs_mm_keys empty so only the final "hidden" tap
+            # is cached.
+            talker_config = getattr(getattr(self, "model", None), "talker_config", None)
+            accept_layer = getattr(talker_config, "accept_hidden_layer", None)
+            if accept_layer is not None:
+                self._lmcache_hs_mm_keys = ("0", str(int(accept_layer)))
             logger.info(
                 "LMCache hidden state store/restore enabled (mm_keys=%s)",
-                _LMCACHE_HS_MM_KEYS,
+                self._lmcache_hs_mm_keys,
             )
 
     def _get_lmcache_adapter(self):
@@ -241,7 +261,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Build {layer_key: gpu_tensor}; chunk keys align with KV.
         layers_to_store: dict[str, torch.Tensor] = {}
         if multimodal_outputs:
-            for key in _LMCACHE_HS_MM_KEYS:
+            for key in self._lmcache_hs_mm_keys:
                 t = multimodal_outputs.get(key)
                 if t is not None and isinstance(t, torch.Tensor):
                     layers_to_store[key] = t
@@ -252,9 +272,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
 
         for layer_key, tensor in layers_to_store.items():
-            layer_idx = _LMCACHE_HS_LAYER_IDX.get(layer_key)
-            if layer_idx is None:
-                continue
+            layer_idx = _hs_layer_idx(layer_key)
             hs_cpu = tensor[:num_tokens_unpadded].detach().to("cpu").contiguous()
             for req_id in self.input_batch.req_ids:
                 req_idx = self.input_batch.req_id_to_index[req_id]
@@ -312,8 +330,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             lookup_ids = self.input_batch.token_ids_cpu[req_idx, :retrieve_len].tolist()
 
             layers: dict[str, torch.Tensor] = {}
-            for layer_key in _LMCACHE_HS_LAYER_KEYS:
-                layer_idx = _LMCACHE_HS_LAYER_IDX[layer_key]
+            for layer_key in (*self._lmcache_hs_mm_keys, "hidden"):
+                layer_idx = _hs_layer_idx(layer_key)
                 hs = hs_store.retrieve_hidden_states(lookup_ids, layer_idx=layer_idx)
                 if hs is None:
                     continue
