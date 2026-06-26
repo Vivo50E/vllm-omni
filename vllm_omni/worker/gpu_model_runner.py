@@ -276,13 +276,23 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         chunk_size = int(getattr(engine.config, "chunk_size", None) or 256)
 
-        # Build {layer_key: gpu_tensor}; chunk keys align with KV.
+        # Captured mm layers live under multimodal_outputs["hidden_states"]
+        # ["layers"], keyed by str or int. Chunk keys align with KV.
         layers_to_store: dict[str, torch.Tensor] = {}
-        if multimodal_outputs:
-            for key in self._lmcache_hs_mm_keys:
-                t = multimodal_outputs.get(key)
-                if t is not None and isinstance(t, torch.Tensor):
-                    layers_to_store[key] = t
+        mm_layers: dict = {}
+        if isinstance(multimodal_outputs, dict):
+            hs_dict = multimodal_outputs.get("hidden_states")
+            if isinstance(hs_dict, dict) and isinstance(hs_dict.get("layers"), dict):
+                mm_layers = hs_dict["layers"]
+        for key in self._lmcache_hs_mm_keys:
+            t = mm_layers.get(key)
+            if t is None:
+                try:
+                    t = mm_layers.get(int(key))
+                except (TypeError, ValueError):
+                    t = None
+            if isinstance(t, torch.Tensor):
+                layers_to_store[key] = t
         if isinstance(hidden_states, torch.Tensor):
             layers_to_store["hidden"] = hidden_states
 
@@ -419,7 +429,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                             fp.write(f"{req_id}\t{num_computed}\t{','.join(sorted(layers.keys()))}\n")
                     except OSError:
                         pass
-                self._restored_mm[req_id] = layers
+                # Key mm layers as the flattened payload key so the prepend in
+                # _build_omni_pooler_payload extends the matching mm_payload
+                # entry; keep "hidden" as-is.
+                self._restored_mm[req_id] = {
+                    (lk if lk == "hidden" else f"hidden_states.layer_{lk}"): hs for lk, hs in layers.items()
+                }
                 # Write into prefix cache slots if available
                 if self.omni_prefix_cache is not None:
                     slot_mapping = self.input_batch.block_table[0].slot_mapping.cpu
