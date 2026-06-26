@@ -601,3 +601,124 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+# ---------------------------------------------------------------------------
+# LMCache HS chunk-boundary buffering tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeHSStore:
+    """Records every store_hidden_states call so tests can assert behavior."""
+
+    def __init__(self):
+        self.calls = []
+
+    def store_hidden_states(self, token_ids, hidden_states, *, layer_idx=0, token_offset=0):
+        self.calls.append(
+            SimpleNamespace(
+                token_ids=list(token_ids),
+                hidden_states=hidden_states.clone(),
+                layer_idx=layer_idx,
+                token_offset=token_offset,
+            )
+        )
+
+
+def _make_lmcache_runner(chunk_size=4, hidden_size=2, req_id="r1", token_capacity=64):
+    """Build a runner stub wired with the LMCache HS path but no real engine."""
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = ()
+    runner._hs_pending_buffer = {}
+    runner._hs_saved_boundary = {}
+
+    hs_store = _FakeHSStore()
+    engine = SimpleNamespace(
+        hidden_state_store=hs_store,
+        config=SimpleNamespace(chunk_size=chunk_size),
+    )
+    adapter = SimpleNamespace(lmcache_engine=engine)
+    runner._get_lmcache_adapter = lambda: adapter
+
+    runner.input_batch = SimpleNamespace(
+        req_ids=[req_id],
+        req_id_to_index={req_id: 0},
+        num_computed_tokens_cpu=torch.tensor([0]),
+        token_ids_cpu=torch.arange(token_capacity).reshape(1, token_capacity),
+    )
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0]))
+    return runner, hs_store
+
+
+def _drive_step(runner, sched, num_computed, hs_rows, hidden_size=2):
+    """Simulate one forward: update num_computed_tokens_cpu and feed HS."""
+    runner.input_batch.num_computed_tokens_cpu = torch.tensor([num_computed])
+    hidden_states = torch.arange(hs_rows * hidden_size, dtype=torch.float32).reshape(hs_rows, hidden_size) + (
+        num_computed * 100.0
+    )
+    sched_out = SimpleNamespace(num_scheduled_tokens={"r1": sched})
+    OmniGPUModelRunner._maybe_store_hs_to_lmcache(
+        runner,
+        hidden_states,
+        None,
+        num_tokens_unpadded=hs_rows,
+        scheduler_output=sched_out,
+    )
+
+
+def test_hs_lmcache_prefill_stores_full_chunks_only():
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # Prefill 10 tokens, chunk_size 4 → new_boundary = 8 (chunks [0:4],[4:8]).
+    _drive_step(runner, sched=10, num_computed=0, hs_rows=10)
+
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 0
+    assert call.token_ids == list(range(8))
+    assert call.hidden_states.shape == (8, 2)
+    assert runner._hs_saved_boundary["r1"] == 8
+    # The trailing 2 rows stay in the buffer for the next boundary crossing.
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 2
+
+
+def test_hs_lmcache_decode_buffers_until_boundary():
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # Step 1: prefill exactly 2 full chunks (8 tokens, no remainder).
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+    assert len(hs_store.calls) == 1
+    assert runner._hs_saved_boundary["r1"] == 8
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 0
+    hs_store.calls.clear()
+
+    # Decode tokens 9, 10, 11 — chunk [8:12] not yet full, must not flush.
+    for nc in (8, 9, 10):
+        _drive_step(runner, sched=1, num_computed=nc, hs_rows=1)
+    assert hs_store.calls == []
+    assert runner._hs_saved_boundary["r1"] == 8
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 3
+
+    # Decode token 12 completes the chunk [8:12]; one flush expected.
+    _drive_step(runner, sched=1, num_computed=11, hs_rows=1)
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 8
+    assert call.token_ids == list(range(12))
+    assert call.hidden_states.shape == (4, 2)
+    assert runner._hs_saved_boundary["r1"] == 12
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 0
+
+
+def test_hs_lmcache_drop_pending_state():
+    runner, _ = _make_lmcache_runner()
+    runner._hs_pending_buffer["r1"] = {"hidden": [torch.zeros((2, 2))]}
+    runner._hs_saved_boundary["r1"] = 4
+
+    runner._drop_hs_pending_state("r1")
+
+    assert "r1" not in runner._hs_pending_buffer
+    assert "r1" not in runner._hs_saved_boundary
+    # Dropping an unknown req_id must be a no-op (idempotent).
+    runner._drop_hs_pending_state("unknown")

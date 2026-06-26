@@ -102,6 +102,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         # the final hidden states). Populated in initialize_metadata_builders
         # from the talker config when LMCache is enabled.
         self._lmcache_hs_mm_keys: tuple[str, ...] = ()
+        # Per-request HS rows accumulated since the last full chunk we flushed
+        # to LMCache. {req_id: {layer_key: list[Tensor]}}. Concatenated and
+        # sliced into chunk-sized writes when a chunk boundary is crossed.
+        self._hs_pending_buffer: dict[str, dict[str, list[torch.Tensor]]] = {}
+        # Per-request highest token index for which all chunks have been
+        # flushed to LMCache. Used as token_offset on the next flush.
+        self._hs_saved_boundary: dict[str, int] = {}
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -244,7 +251,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_tokens_unpadded: int,
         scheduler_output,
     ):
-        """Store per-layer hidden states to LMCache alongside KV cache."""
+        """Buffer per-step HS and flush full chunks to LMCache on chunk boundary crossings.
+
+        LMCache's HS pool is chunk-aligned (same boundaries as KV). Storing every
+        forward's HS with ``token_offset=num_computed`` only writes the chunk that
+        starts exactly at ``num_computed``, so during decode it would either write
+        a useless 1-token partial or skip the chunk entirely once it grows past
+        ``num_computed``. We buffer this request's HS rows since the last flushed
+        chunk boundary and only call ``store_hidden_states`` when a new chunk
+        completes, passing the chunk-aligned token slice and ``token_offset``
+        set to the previous boundary. Mirrors KV's "wait for full chunk" semantic.
+        """
         if not self._has_lmcache:
             return
         adapter = self._get_lmcache_adapter()
@@ -256,6 +273,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         hs_store = engine.hidden_state_store
         if hs_store is None:
             return
+
+        chunk_size = int(getattr(engine.config, "chunk_size", None) or 256)
 
         # Build {layer_key: gpu_tensor}; chunk keys align with KV.
         layers_to_store: dict[str, torch.Tensor] = {}
@@ -270,22 +289,57 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not layers_to_store:
             return
 
-        for layer_key, tensor in layers_to_store.items():
-            layer_idx = _hs_layer_idx(layer_key)
-            hs_cpu = tensor[:num_tokens_unpadded].detach().to("cpu").contiguous()
-            for req_id in self.input_batch.req_ids:
-                req_idx = self.input_batch.req_id_to_index[req_id]
-                sched = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-                if sched <= 0:
-                    continue
-                start = int(self.query_start_loc.cpu[req_idx])
-                req_hs = hs_cpu[start : start + sched]
-                num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
-                seg_token_ids = self.input_batch.token_ids_cpu[req_idx, : num_computed + sched].tolist()
+        # Move each layer's batch HS to CPU once, then slice per request.
+        hs_cpu_by_layer: dict[str, torch.Tensor] = {
+            k: t[:num_tokens_unpadded].detach().to("cpu").contiguous() for k, t in layers_to_store.items()
+        }
+
+        for req_id in self.input_batch.req_ids:
+            sched = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if sched <= 0:
+                continue
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            start = int(self.query_start_loc.cpu[req_idx])
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            total = num_computed + sched
+
+            # Append this step's per-layer HS to the request's buffer.
+            req_buf = self._hs_pending_buffer.setdefault(req_id, {})
+            for layer_key in layers_to_store:
+                req_buf.setdefault(layer_key, []).append(hs_cpu_by_layer[layer_key][start : start + sched])
+
+            # Flush only when a new chunk boundary has been crossed.
+            saved_boundary = self._hs_saved_boundary.get(req_id, 0)
+            new_boundary = (total // chunk_size) * chunk_size
+            if new_boundary <= saved_boundary:
+                continue
+
+            chunk_rows = new_boundary - saved_boundary
+            seg_token_ids = self.input_batch.token_ids_cpu[req_idx, :new_boundary].tolist()
+
+            for layer_key, buf in req_buf.items():
+                layer_idx = _hs_layer_idx(layer_key)
+                full_buf = torch.cat(buf, dim=0) if len(buf) > 1 else buf[0]
+                chunk_hs = full_buf[:chunk_rows]
                 try:
-                    hs_store.store_hidden_states(seg_token_ids, req_hs, layer_idx=layer_idx, token_offset=num_computed)
+                    hs_store.store_hidden_states(
+                        seg_token_ids, chunk_hs, layer_idx=layer_idx, token_offset=saved_boundary
+                    )
                 except Exception:
                     pass
+                remainder = full_buf[chunk_rows:]
+                req_buf[layer_key] = [remainder] if remainder.shape[0] > 0 else []
+
+            self._hs_saved_boundary[req_id] = new_boundary
+
+    def _drop_hs_pending_state(self, req_id: str) -> None:
+        """Discard any buffered HS / saved-boundary state for ``req_id``.
+
+        Called on request finish (and on preempt) so we don't carry stale
+        partial-chunk buffers across the request lifecycle.
+        """
+        self._hs_pending_buffer.pop(req_id, None)
+        self._hs_saved_boundary.pop(req_id, None)
 
     def _maybe_restore_hs_from_lmcache(self, scheduler_output=None):
         """Restore per-layer hidden states from LMCache.
@@ -697,6 +751,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._talker_mtp_generators.pop(req_id, None)
             if cleanup_finished_request is not None:
                 cleanup_finished_request(req_id)
+            self._drop_hs_pending_state(req_id)
 
         self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
