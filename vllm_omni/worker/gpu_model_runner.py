@@ -351,6 +351,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         """
         self._hs_pending_buffer.pop(req_id, None)
         self._hs_saved_boundary.pop(req_id, None)
+        restored_mm = getattr(self, "_restored_mm", None)
+        if restored_mm is not None:
+            restored_mm.pop(req_id, None)
 
     def _maybe_restore_hs_from_lmcache(self, scheduler_output=None):
         """Restore per-layer hidden states from LMCache.
@@ -372,7 +375,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hs_store is None:
             return
 
-        self._restored_mm: dict[str, dict[str, torch.Tensor]] = {}
+        # Per-request restored HS, consumed (popped) by _build_omni_pooler_payload.
+        # Do NOT wipe wholesale each step: with async omni output the pooler build
+        # is deferred, so a later step's restore must not clear an earlier req's
+        # entry before its (deferred) payload build consumes it.
+        if getattr(self, "_restored_mm", None) is None:
+            self._restored_mm: dict[str, dict[str, torch.Tensor]] = {}
         for new_req in scheduler_output.scheduled_new_reqs:
             if new_req.num_computed_tokens <= 0:
                 continue
