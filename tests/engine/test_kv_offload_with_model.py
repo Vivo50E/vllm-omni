@@ -28,6 +28,9 @@ def build_stage_config(model: str, mode: str) -> str:
     omni_kv_config = MODES[mode]
 
     config = {
+        # main now validates async_chunk producers; Qwen2.5-Omni has no
+        # async-chunk stage processor, so pin it off for this offline config.
+        "async_chunk": False,
         "stages": [
             {
                 "stage_id": 0,
