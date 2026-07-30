@@ -172,7 +172,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         if cfg is not None:
             self._omni_prefix_cache_cfg = cfg
 
-        omni_kv = getattr(self.model_config, "omni_kv_config", None)
+        omni_kv = getattr(getattr(self, "model_config", None), "omni_kv_config", None)
         self._has_lmcache = isinstance(omni_kv, dict) and "kv_store_config" in omni_kv
         if self._has_lmcache:
             # Discover the multimodal layer captures the thinker exposes via its
