@@ -1082,3 +1082,80 @@ def test_write_restored_hidden_states_uses_per_request_slots():
     # r1's slots 8..13 written; r0's slots 0..7 untouched (the old bug wrote here).
     assert torch.all(cache.hidden_states_cache[8:14] == 1)
     assert torch.all(cache.hidden_states_cache[0:8] == 0)
+
+
+def test_pooler_payload_casts_restored_prefix_to_batch_dtype(monkeypatch):
+    """#5: LMCache returns CPU float32; prepending onto bf16 activations must not raise."""
+    import vllm_omni.worker.gpu_ar_model_runner as ar_mod
+
+    monkeypatch.setattr(
+        ar_mod, "build_omni_mm_payload", lambda **kwargs: {"mm0": torch.ones(2, 2, dtype=torch.bfloat16)}
+    )
+
+    runner = object.__new__(GPUARModelRunner)
+    runner._restored_mm = {
+        "r1": {
+            "hidden": torch.zeros(3, 2, dtype=torch.float32),
+            "mm0": torch.zeros(3, 2, dtype=torch.float32),
+        }
+    }
+
+    payload = GPUARModelRunner._build_omni_pooler_payload(
+        runner,
+        rid="r1",
+        idx=0,
+        start=0,
+        end=2,
+        hidden_states_cpu=None,
+        req_hidden_states_cpu={"r1": torch.ones(2, 2, dtype=torch.bfloat16)},
+        combined_hidden_states=None,
+        combined_multimodal_outputs=None,
+        mm_cpu=None,
+        audio_sparse_output=False,
+        sparse_mm_index={},
+        hidden_seq_len=2,
+        scheduled_seq_len=2,
+    )
+
+    # Both the "hidden" tap and the mm layer are prepended in the batch's dtype.
+    assert payload["hidden"].dtype == torch.bfloat16
+    assert payload["hidden"].shape[0] == 5
+    assert payload["mm0"].dtype == torch.bfloat16
+    assert payload["mm0"].shape[0] == 5
+
+
+def test_hs_lmcache_store_slices_per_request_in_multi_request_batch():
+    """#11: each request must buffer only its own rows of the flattened batch HS."""
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = ()
+    runner._hs_pending_buffer = {}
+    runner._hs_saved_boundary = {}
+
+    hs_store = _FakeHSStore()
+    engine = SimpleNamespace(hidden_state_store=hs_store, config=SimpleNamespace(chunk_size=4))
+    runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
+
+    # r0 occupies rows 0..3, r1 rows 4..7 of the flattened batch.
+    runner.input_batch = SimpleNamespace(
+        req_ids=["r0", "r1"],
+        req_id_to_index={"r0": 0, "r1": 1},
+        num_computed_tokens_cpu=torch.tensor([0, 0]),
+        token_ids_cpu=torch.arange(128).reshape(2, 64),
+    )
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 4]))
+
+    # Row i is filled with value i so provenance is checkable.
+    hidden_states = torch.arange(8, dtype=torch.float32).reshape(8, 1).repeat(1, 2)
+    sched_out = SimpleNamespace(num_scheduled_tokens={"r0": 4, "r1": 4})
+
+    LMCacheHiddenStateMixin._maybe_store_hs_to_lmcache(
+        runner, hidden_states, None, num_tokens_unpadded=8, scheduler_output=sched_out
+    )
+
+    assert len(hs_store.calls) == 2
+    by_offset = {tuple(c.token_ids[:1]): c.hidden_states for c in hs_store.calls}
+    # r0 stored rows 0..3, r1 stored rows 4..7 -- not the batch's first 4 twice.
+    assert torch.equal(hs_store.calls[0].hidden_states[:, 0], torch.tensor([0.0, 1.0, 2.0, 3.0]))
+    assert torch.equal(hs_store.calls[1].hidden_states[:, 0], torch.tensor([4.0, 5.0, 6.0, 7.0]))
+    assert len(by_offset) == 2
