@@ -14,11 +14,8 @@ where a second round is served from cache. The outputs must match token for
 token.
 """
 
-import tempfile
-
 import pytest
 import torch
-import yaml
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
 
@@ -31,18 +28,17 @@ SHARED_PREFIX = " ".join(
 )
 
 
-def _build_stage_config(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilization: float) -> str:
-    stage: dict = {
-        "stage_id": 0,
+def _thinker_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilization: float) -> dict:
+    """Override only the thinker stage; the rest of the model's default deploy
+    pipeline (talker, code2wav) is kept so audio is still produced."""
+    overrides: dict = {
         "max_model_len": 1024,
         "max_num_batched_tokens": 1024,
         "max_num_seqs": 4,
         "gpu_memory_utilization": gpu_memory_utilization,
-        "skip_mm_profiling": True,
         "enforce_eager": True,
-        "trust_remote_code": True,
         "enable_prefix_caching": prefix_caching,
-        "devices": "0",
+        "async_chunk": False,
         "default_sampling_params": {
             "temperature": 0.0,
             "max_tokens": 48,
@@ -50,13 +46,8 @@ def _build_stage_config(*, lmcache: bool, prefix_caching: bool, gpu_memory_utili
         },
     }
     if lmcache:
-        stage["omni_kv_config"] = {"kv_store_config": {"lmcache_config": {"config_file": ""}}}
-
-    config = {"async_chunk": False, "stages": [stage]}
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
-    yaml.dump(config, tmp, default_flow_style=False)
-    tmp.flush()
-    return tmp.name
+        overrides["omni_kv_config"] = {"kv_store_config": {"lmcache_config": {"config_file": ""}}}
+    return {"0": overrides}
 
 
 def _prompts(n: int = 3) -> list[dict]:
@@ -88,14 +79,14 @@ def _run(*, lmcache: bool, prefix_caching: bool, rounds: int, gpu_memory_utiliza
     """Build an engine, run ``rounds`` identical rounds, return the last one."""
     from vllm_omni.entrypoints.omni import Omni
 
-    config_path = _build_stage_config(
-        lmcache=lmcache,
-        prefix_caching=prefix_caching,
-        gpu_memory_utilization=gpu_memory_utilization,
-    )
     omni = Omni(
         model=DEFAULT_MODEL,
-        stage_configs_path=config_path,
+        stage_overrides=_thinker_overrides(
+            lmcache=lmcache,
+            prefix_caching=prefix_caching,
+            gpu_memory_utilization=gpu_memory_utilization,
+        ),
+        trust_remote_code=True,
         stage_init_timeout=600,
         batch_timeout=5,
         init_timeout=600,
