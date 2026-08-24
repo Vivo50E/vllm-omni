@@ -58,7 +58,7 @@ stages:
 
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-3B --omni --port 8091 \
-    --stage-configs-path /path/to/qwen2_5_omni_kv_offload.yaml
+    --deploy-config /path/to/qwen2_5_omni_kv_offload.yaml
 ```
 
 With this configuration the thinker stores per-layer hidden states into
@@ -79,7 +79,7 @@ from vllm_omni.entrypoints.omni import Omni
 
 omni = Omni(
     model="Qwen/Qwen2.5-Omni-3B",
-    stage_configs_path="qwen2_5_omni_kv_offload.yaml",
+    deploy_config="qwen2_5_omni_kv_offload.yaml",
 )
 outputs = omni.generate(prompts, omni.default_sampling_params_list)
 omni.close()
