@@ -574,6 +574,37 @@ class OmniTensorPrefixCache:
         block_ids = block_table[req_idx, block_offsets].to(torch.long)
         return block_ids * self.block_size + (token_positions % self.block_size)
 
+    def write_restored_hidden_states(
+        self,
+        req_idx: int,
+        input_batch: InputBatch,
+        layer_key: str,
+        hs: torch.Tensor,
+        token_start: int = 0,
+    ) -> None:
+        """Scatter a single request's restored prefix HS into its own KV slots.
+
+        ``layer_key`` is ``"hidden"`` for the final hidden-state cache or an mm
+        key present in ``mm_outputs_cache``. Slots are resolved per request via
+        ``_get_slot_ids_for_token_range`` (not the whole-batch slot_mapping), and
+        value dtype/device are coerced to the cache's.
+        """
+        if layer_key == "hidden":
+            cache = self.hidden_states_cache
+        else:
+            cache = self.mm_outputs_cache.get(layer_key)
+        if cache is None or hs is None:
+            return
+        n = int(hs.shape[0])
+        slots = self._get_slot_ids_for_token_range(req_idx, input_batch, token_start, n)
+        m = min(n, int(slots.shape[0]))
+        if m <= 0:
+            return
+        flat = cache.view(-1, cache.shape[-1])
+        slot_idx = slots[:m].to(device=flat.device, dtype=torch.int64)
+        src = hs[:m].to(device=flat.device, dtype=flat.dtype)
+        flat.index_copy_(0, slot_idx, src)
+
     def _coerce_to_payload_dict(
         self,
         element: object,

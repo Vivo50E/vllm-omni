@@ -204,7 +204,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
 
         omni_kv = getattr(getattr(self, "model_config", None), "omni_kv_config", None)
-        self._has_lmcache = isinstance(omni_kv, dict) and "kv_store_config" in omni_kv
+        # Match arg_utils._map_offload_config: active only with lmcache_config.
+        kv_store = omni_kv.get("kv_store_config") if isinstance(omni_kv, dict) else None
+        self._has_lmcache = isinstance(kv_store, dict) and bool(kv_store.get("lmcache_config"))
         if self._has_lmcache:
             # Discover the multimodal layer captures the thinker exposes via its
             # talker config so the runner mirrors the same set into LMCache.
@@ -317,12 +319,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
             total = num_computed + sched
 
-            # Append this step's per-layer HS to the request's buffer.
+            # Preemption/reset regressed this request; drop stale buffered HS.
+            if num_computed < self._hs_saved_boundary.get(req_id, 0):
+                self._drop_hs_pending_state(req_id)
+
+            # Every layer must cover this request's rows; skip otherwise to avoid
+            # buffering a misaligned/partial chunk.
+            if any(int(hs_cpu_by_layer[k].shape[0]) < start + sched for k in layers_to_store):
+                continue
+
             req_buf = self._hs_pending_buffer.setdefault(req_id, {})
             for layer_key in layers_to_store:
                 req_buf.setdefault(layer_key, []).append(hs_cpu_by_layer[layer_key][start : start + sched])
 
-            # Flush only when a new chunk boundary has been crossed.
             saved_boundary = self._hs_saved_boundary.get(req_id, 0)
             new_boundary = (total // chunk_size) * chunk_size
             if new_boundary <= saved_boundary:
@@ -330,20 +339,26 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             chunk_rows = new_boundary - saved_boundary
             seg_token_ids = self.input_batch.token_ids_cpu[req_idx, :new_boundary].tolist()
+            full_bufs = {k: (torch.cat(b, dim=0) if len(b) > 1 else b[0]) for k, b in req_buf.items()}
+            if any(int(fb.shape[0]) < chunk_rows for fb in full_bufs.values()):
+                continue
 
-            for layer_key, buf in req_buf.items():
-                layer_idx = _hs_layer_idx(layer_key)
-                full_buf = torch.cat(buf, dim=0) if len(buf) > 1 else buf[0]
-                chunk_hs = full_buf[:chunk_rows]
+            all_stored = True
+            for layer_key, full_buf in full_bufs.items():
                 try:
                     hs_store.store_hidden_states(
-                        seg_token_ids, chunk_hs, layer_idx=layer_idx, token_offset=saved_boundary
+                        seg_token_ids, full_buf[:chunk_rows], layer_idx=_hs_layer_idx(layer_key), token_offset=saved_boundary
                     )
                 except Exception:
-                    pass
+                    logger.exception("LMCache: store_hidden_states failed (req_id=%s layer=%s)", req_id, layer_key)
+                    all_stored = False
+            # Only trim buffers and advance the boundary once every layer's chunk
+            # is persisted, so a failure retries the same boundary next step.
+            if not all_stored:
+                continue
+            for layer_key, full_buf in full_bufs.items():
                 remainder = full_buf[chunk_rows:]
                 req_buf[layer_key] = [remainder] if remainder.shape[0] > 0 else []
-
             self._hs_saved_boundary[req_id] = new_boundary
 
     def _drop_hs_pending_state(self, req_id: str) -> None:
@@ -357,6 +372,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         restored_mm = getattr(self, "_restored_mm", None)
         if restored_mm is not None:
             restored_mm.pop(req_id, None)
+
+    def _maybe_write_hs_restore_marker(self, req_id: str, num_computed: int, layers: dict) -> None:
+        """Test-only hook: record a restore event when OMNI_HS_RESTORE_MARKER_PATH is set."""
+        marker_path = os.environ.get("OMNI_HS_RESTORE_MARKER_PATH")
+        if not marker_path:
+            return
+        try:
+            with open(marker_path, "a", encoding="utf-8") as fp:
+                fp.write(f"{req_id}\t{num_computed}\t{','.join(sorted(layers.keys()))}\n")
+        except OSError:
+            pass
 
     def _maybe_restore_hs_from_lmcache(self, scheduler_output=None):
         """Restore per-layer hidden states from LMCache.
@@ -405,67 +431,40 @@ class OmniGPUModelRunner(GPUModelRunner):
             lookup_ids = self.input_batch.token_ids_cpu[req_idx, :retrieve_len].tolist()
 
             layers: dict[str, torch.Tensor] = {}
+            incomplete = False
             for layer_key in (*self._lmcache_hs_mm_keys, "hidden"):
-                layer_idx = _hs_layer_idx(layer_key)
-                hs = hs_store.retrieve_hidden_states(lookup_ids, layer_idx=layer_idx)
-                if hs is None:
-                    continue
-                # HS pool may LRU-evict independently of KV; skip layers whose
-                # cached prefix is shorter than what KV restored to avoid
-                # writing incomplete HS into prefix_cache.
-                if hs.shape[0] < num_computed:
-                    logger.warning(
-                        "LMCache: partial HS for req_id=%s layer=%s (got %d < num_computed %d), skipping",
-                        req_id,
-                        layer_key,
-                        int(hs.shape[0]),
-                        num_computed,
-                    )
-                    continue
-                if hs.shape[0] > num_computed:
-                    hs = hs[:num_computed]
-                layers[layer_key] = hs
+                hs = hs_store.retrieve_hidden_states(lookup_ids, layer_idx=_hs_layer_idx(layer_key))
+                if hs is None or int(hs.shape[0]) < num_computed:
+                    incomplete = True
+                    break
+                layers[layer_key] = hs[:num_computed]
 
-            if layers:
-                logger.info(
-                    "LMCache: restored hidden states from cache (req_id=%s, num_prefix_tokens=%d, layer_keys=%s)",
+            if incomplete:
+                # KV is already restored but HS is not fully available; prepending
+                # would give the talker truncated conditioning. Fail loud, write nothing.
+                logger.error(
+                    "LMCache: incomplete HS restore for req_id=%s (num_computed=%d); skipping "
+                    "prepend. Size the HS pool >= KV pool or disable HS offload.",
                     req_id,
                     num_computed,
-                    list(layers.keys()),
                 )
-                # Optional hook for E2E tests (worker subprocess inherits env).
-                marker_path = os.environ.get("OMNI_HS_RESTORE_MARKER_PATH")
-                if marker_path:
-                    try:
-                        with open(marker_path, "a", encoding="utf-8") as fp:
-                            fp.write(f"{req_id}\t{num_computed}\t{','.join(sorted(layers.keys()))}\n")
-                    except OSError:
-                        pass
-                # Key mm layers as the flattened payload key so the prepend in
-                # _build_omni_pooler_payload extends the matching mm_payload
-                # entry; keep "hidden" as-is.
-                self._restored_mm[req_id] = {
-                    (lk if lk == "hidden" else f"hidden_states.layer_{lk}"): hs for lk, hs in layers.items()
-                }
-                # Write into prefix cache slots if available
-                if self.omni_prefix_cache is not None:
-                    slot_mapping = self.input_batch.block_table[0].slot_mapping.cpu
-                    for layer_key, hs in layers.items():
-                        if layer_key == "hidden":
-                            flat = self.omni_prefix_cache.hidden_states_cache.view(
-                                -1,
-                                self.omni_prefix_cache.hidden_states_cache.shape[-1],
-                            )
-                        elif layer_key in self.omni_prefix_cache.mm_outputs_cache:
-                            flat = self.omni_prefix_cache.mm_outputs_cache[layer_key].view(
-                                -1,
-                                self.omni_prefix_cache.mm_outputs_cache[layer_key].shape[-1],
-                            )
-                        else:
-                            continue
-                        n = min(int(hs.shape[0]), int(slot_mapping.shape[0]))
-                        idx = slot_mapping[:n].to(flat.device, non_blocking=True)
-                        flat[idx] = hs[:n].to(device=flat.device, dtype=flat.dtype, non_blocking=True)
+                continue
+            if not layers:
+                continue
+
+            logger.debug(
+                "LMCache: restored HS (req_id=%s, num_prefix_tokens=%d, layers=%s)",
+                req_id,
+                num_computed,
+                list(layers.keys()),
+            )
+            self._maybe_write_hs_restore_marker(req_id, num_computed, layers)
+            # mm layers use the flattened payload key; "hidden" stays as-is.
+            remapped = {(lk if lk == "hidden" else f"hidden_states.layer_{lk}"): hs for lk, hs in layers.items()}
+            self._restored_mm[req_id] = remapped
+            if self.omni_prefix_cache is not None:
+                for cache_key, hs in remapped.items():
+                    self.omni_prefix_cache.write_restored_hidden_states(req_idx, self.input_batch, cache_key, hs)
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:

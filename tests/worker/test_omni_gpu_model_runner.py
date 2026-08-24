@@ -999,3 +999,108 @@ def test_hs_lmcache_drop_pending_state():
     assert "r1" not in runner._hs_saved_boundary
     # Dropping an unknown req_id must be a no-op (idempotent).
     runner._drop_hs_pending_state("unknown")
+
+
+class _RaisingHSStore(_FakeHSStore):
+    def store_hidden_states(self, token_ids, hidden_states, *, layer_idx=0, token_offset=0):
+        raise RuntimeError("store failed")
+
+
+def test_hs_lmcache_store_failure_keeps_boundary_and_buffer():
+    """#6b: a failed store must not advance the boundary or trim the buffer."""
+    runner, _ = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+    runner._get_lmcache_adapter().lmcache_engine.hidden_state_store = _RaisingHSStore()
+
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+
+    assert "r1" not in runner._hs_saved_boundary
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 8
+
+
+def test_hs_lmcache_regression_resets_state():
+    """#3: num_computed regressing below the saved boundary (preempt) resets state."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+    assert runner._hs_saved_boundary["r1"] == 8
+    hs_store.calls.clear()
+
+    # Request comes back with fewer computed tokens than we had flushed.
+    _drive_step(runner, sched=4, num_computed=2, hs_rows=4)
+
+    # Without the reset, new_boundary (4) <= stale 8 would skip flushing forever.
+    assert runner._hs_saved_boundary["r1"] == 4
+    assert len(hs_store.calls) == 1
+
+
+class _FakeRetrieveStore:
+    """retrieve_hidden_states returns a configurable per-layer prefix (or None)."""
+
+    def __init__(self, rows_by_layer):
+        self._rows_by_layer = rows_by_layer
+
+    def retrieve_hidden_states(self, token_ids, *, layer_idx=0):
+        rows = self._rows_by_layer.get(layer_idx)
+        if rows is None:
+            return None
+        return torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
+
+
+def _make_restore_runner(rows_by_layer, num_computed=8, chunk_size=4, mm_keys=()):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = mm_keys
+    runner.omni_prefix_cache = None
+    engine = SimpleNamespace(
+        hidden_state_store=_FakeRetrieveStore(rows_by_layer),
+        config=SimpleNamespace(chunk_size=chunk_size),
+    )
+    runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={"r1": 0},
+        num_prompt_tokens=torch.tensor([64]),
+        token_ids_cpu=torch.arange(64).reshape(1, 64),
+    )
+    sched_out = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)]
+    )
+    return runner, sched_out
+
+
+def test_restore_incomplete_hs_sets_no_payload():
+    """#2: a missing required layer must not produce a partial payload."""
+    runner, sched_out = _make_restore_runner(rows_by_layer={-1: None})  # "hidden" (idx -1) misses
+
+    OmniGPUModelRunner._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert runner._restored_mm.get("r1") is None
+
+
+def test_restore_full_hs_sets_payload():
+    """#2: all required layers present -> payload is set."""
+    runner, sched_out = _make_restore_runner(rows_by_layer={-1: 8})  # "hidden" (idx -1) full-length
+
+    OmniGPUModelRunner._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert "hidden" in runner._restored_mm["r1"]
+    assert runner._restored_mm["r1"]["hidden"].shape[0] == 8
+
+
+def test_write_restored_hidden_states_uses_per_request_slots():
+    """#1: restore write must target the request's own slots, not the batch's first-n."""
+    from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+
+    cache = object.__new__(OmniTensorPrefixCache)
+    cache.block_size = 4
+    cache.hidden_states_cache = torch.zeros(32, 2)  # 8 blocks * 4
+    cache.mm_outputs_cache = {}
+
+    # r0 -> blocks [0,1] (slots 0..7); r1 -> blocks [2,3] (slots 8..15).
+    block_table = torch.tensor([[0, 1, 0, 0], [2, 3, 0, 0]])
+    input_batch = SimpleNamespace(block_table=[SimpleNamespace(block_table=SimpleNamespace(cpu=block_table))])
+
+    hs = torch.ones(6, 2)
+    cache.write_restored_hidden_states(1, input_batch, "hidden", hs)
+
+    # r1's slots 8..13 written; r0's slots 0..7 untouched (the old bug wrote here).
+    assert torch.all(cache.hidden_states_cache[8:14] == 1)
+    assert torch.all(cache.hidden_states_cache[0:8] == 0)
