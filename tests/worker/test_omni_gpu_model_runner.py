@@ -14,6 +14,7 @@ from vllm_omni.worker.gpu_model_runner import (
     OmniGPUModelRunner,
     _filter_mrope_kwargs_for_model,
 )
+from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -904,7 +905,7 @@ class _FakeHSStore:
 
 def _make_lmcache_runner(chunk_size=4, hidden_size=2, req_id="r1", token_capacity=64):
     """Build a runner stub wired with the LMCache HS path but no real engine."""
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = object.__new__(LMCacheHiddenStateMixin)
     runner._has_lmcache = True
     runner._lmcache_hs_mm_keys = ()
     runner._hs_pending_buffer = {}
@@ -935,7 +936,7 @@ def _drive_step(runner, sched, num_computed, hs_rows, hidden_size=2):
         num_computed * 100.0
     )
     sched_out = SimpleNamespace(num_scheduled_tokens={"r1": sched})
-    OmniGPUModelRunner._maybe_store_hs_to_lmcache(
+    LMCacheHiddenStateMixin._maybe_store_hs_to_lmcache(
         runner,
         hidden_states,
         None,
@@ -1046,7 +1047,7 @@ class _FakeRetrieveStore:
 
 
 def _make_restore_runner(rows_by_layer, num_computed=8, chunk_size=4, mm_keys=()):
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = object.__new__(LMCacheHiddenStateMixin)
     runner._has_lmcache = True
     runner._lmcache_hs_mm_keys = mm_keys
     runner.omni_prefix_cache = None
@@ -1060,9 +1061,7 @@ def _make_restore_runner(rows_by_layer, num_computed=8, chunk_size=4, mm_keys=()
         num_prompt_tokens=torch.tensor([64]),
         token_ids_cpu=torch.arange(64).reshape(1, 64),
     )
-    sched_out = SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)]
-    )
+    sched_out = SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)])
     return runner, sched_out
 
 
@@ -1070,7 +1069,7 @@ def test_restore_incomplete_hs_sets_no_payload():
     """#2: a missing required layer must not produce a partial payload."""
     runner, sched_out = _make_restore_runner(rows_by_layer={-1: None})  # "hidden" (idx -1) misses
 
-    OmniGPUModelRunner._maybe_restore_hs_from_lmcache(runner, sched_out)
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
 
     assert runner._restored_mm.get("r1") is None
 
@@ -1079,7 +1078,7 @@ def test_restore_full_hs_sets_payload():
     """#2: all required layers present -> payload is set."""
     runner, sched_out = _make_restore_runner(rows_by_layer={-1: 8})  # "hidden" (idx -1) full-length
 
-    OmniGPUModelRunner._maybe_restore_hs_from_lmcache(runner, sched_out)
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
 
     assert "hidden" in runner._restored_mm["r1"]
     assert runner._restored_mm["r1"]["hidden"].shape[0] == 8

@@ -53,6 +53,7 @@ from vllm_omni.utils.mm_outputs import (
     snapshot_mm_payload,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -312,7 +313,9 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
-class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
+class GPUARModelRunner(
+    LMCacheHiddenStateMixin, OmniGPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin
+):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     Follows the v0.12 two-phase execute/sample flow from GPUModelRunner, and
