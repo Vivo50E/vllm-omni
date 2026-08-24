@@ -1105,6 +1105,49 @@ def test_write_restored_hidden_states_uses_per_request_slots():
     assert torch.all(cache.hidden_states_cache[0:8] == 0)
 
 
+def test_restore_remaps_mm_layers_to_flattened_payload_keys():
+    """Qwen3-Omni-style captures must land under the flattened payload keys.
+
+    Only models exposing talker_config.accept_hidden_layer populate
+    _lmcache_hs_mm_keys, so this path never runs on Qwen2.5-Omni.
+    """
+    runner, sched_out = _make_restore_runner(
+        rows_by_layer={-1: 8, 0: 8, 24: 8},  # "hidden" (-1) plus captures 0 and 24
+        mm_keys=("0", "24"),
+    )
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert set(runner._restored_mm["r1"]) == {"hidden", "hidden_states.layer_0", "hidden_states.layer_24"}
+
+
+def test_restore_writes_mm_layers_into_prefix_cache_under_matching_keys():
+    """The mm cache is keyed by the flattened name; a raw "0"/"24" lookup never matches."""
+    from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+
+    cache = object.__new__(OmniTensorPrefixCache)
+    cache.block_size = 16
+    cache.hidden_states_cache = torch.zeros(64, 2)
+    cache.mm_outputs_cache = {
+        "hidden_states.layer_0": torch.zeros(64, 2),
+        "hidden_states.layer_24": torch.zeros(64, 2),
+    }
+
+    runner, sched_out = _make_restore_runner(
+        rows_by_layer={-1: 8, 0: 8, 24: 8},
+        mm_keys=("0", "24"),
+    )
+    runner.omni_prefix_cache = cache
+    runner.input_batch.block_table = [SimpleNamespace(block_table=SimpleNamespace(cpu=torch.tensor([[0, 1, 2, 3]])))]
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    # Rows 1..7 of the fake store are non-zero, so a real write is observable.
+    for key in ("hidden_states.layer_0", "hidden_states.layer_24"):
+        assert cache.mm_outputs_cache[key][:8].abs().sum() > 0, f"{key} was never written"
+    assert cache.hidden_states_cache[:8].abs().sum() > 0
+
+
 def test_pooler_payload_casts_restored_prefix_to_batch_dtype(monkeypatch):
     """#5: LMCache returns CPU float32; prepending onto bf16 activations must not raise."""
     import vllm_omni.worker.gpu_ar_model_runner as ar_mod
