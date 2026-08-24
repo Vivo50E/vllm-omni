@@ -986,11 +986,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             for layer_key, prefix_tensor in restored_mm.pop(rid).items():
                 if layer_key == "hidden":
                     if req_hidden_states is not None:
+                        prefix_tensor = prefix_tensor.to(device=req_hidden_states.device, dtype=req_hidden_states.dtype)
                         req_hidden_states = torch.cat([prefix_tensor, req_hidden_states], dim=0)
                 else:
                     current = mm_payload.get(layer_key)
                     if current is not None and isinstance(current, torch.Tensor):
+                        prefix_tensor = prefix_tensor.to(device=current.device, dtype=current.dtype)
                         mm_payload[layer_key] = torch.cat([prefix_tensor, current], dim=0)
+                    elif req_hidden_states is not None:
+                        mm_payload[layer_key] = prefix_tensor.to(
+                            device=req_hidden_states.device, dtype=req_hidden_states.dtype
+                        )
                     else:
                         mm_payload[layer_key] = prefix_tensor
 
@@ -1337,7 +1343,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 ) as kv_connector_output,
             ):
                 # Restore HS from LMCache after KV load (start_load_kv already ran)
-                self._maybe_restore_hs_from_lmcache(scheduler_output)
+                if get_pp_group().is_last_rank:
+                    self._maybe_restore_hs_from_lmcache(scheduler_output)
 
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -1395,12 +1402,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
 
             # Store multimodal HS (layers "0", "24") + last layer to LMCache
-            self._maybe_store_hs_to_lmcache(
-                hidden_states,
-                multimodal_outputs,
-                num_tokens_unpadded,
-                scheduler_output,
-            )
+            if get_pp_group().is_last_rank:
+                self._maybe_store_hs_to_lmcache(
+                    hidden_states,
+                    multimodal_outputs,
+                    num_tokens_unpadded,
+                    scheduler_output,
+                )
 
             if not self.broadcast_pp_output:
                 # Common case.
