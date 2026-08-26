@@ -52,10 +52,27 @@ def _stage_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilizat
     }
     if lmcache:
         thinker["omni_kv_config"] = {"kv_store_config": {"lmcache_config": {"config_file": ""}}}
+    # The talker ships with temperature 0.9 / top_p 0.8 / top_k 40. Under
+    # sampling, the float-level differences that prefix caching legitimately
+    # introduces (a cached prefix skips prefill, so attention is computed over
+    # different chunk boundaries) flip a code and the audio diverges for reasons
+    # that have nothing to do with the restore path. Pin every stage to greedy
+    # so a mismatch actually means the restored state was wrong.
+    greedy = {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "seed": 42, "max_tokens": 48}
     return {
         "0": thinker,
-        "1": {"devices": "0", "gpu_memory_utilization": 0.1, "enforce_eager": True},
-        "2": {"devices": "0", "gpu_memory_utilization": 0.05, "enforce_eager": True},
+        "1": {
+            "devices": "0",
+            "gpu_memory_utilization": 0.1,
+            "enforce_eager": True,
+            "default_sampling_params": greedy,
+        },
+        "2": {
+            "devices": "0",
+            "gpu_memory_utilization": 0.05,
+            "enforce_eager": True,
+            "default_sampling_params": greedy,
+        },
     }
 
 
