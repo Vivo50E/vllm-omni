@@ -28,10 +28,14 @@ SHARED_PREFIX = " ".join(
 )
 
 
-def _thinker_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilization: float) -> dict:
-    """Override only the thinker stage; the rest of the model's default deploy
-    pipeline (talker, code2wav) is kept so audio is still produced."""
-    overrides: dict = {
+def _stage_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilization: float) -> dict:
+    """Patch the thinker stage and keep the model's default talker/code2wav
+    stages, since audio is what the hidden-state restore path feeds.
+
+    Every stage is pinned to device 0: the default deploy config spreads the
+    stages across two GPUs, and a 3B pipeline fits on one comfortably.
+    """
+    thinker: dict = {
         "max_model_len": 1024,
         "max_num_batched_tokens": 1024,
         "max_num_seqs": 4,
@@ -39,6 +43,7 @@ def _thinker_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utiliz
         "enforce_eager": True,
         "enable_prefix_caching": prefix_caching,
         "async_chunk": False,
+        "devices": "0",
         "default_sampling_params": {
             "temperature": 0.0,
             "max_tokens": 48,
@@ -46,8 +51,12 @@ def _thinker_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utiliz
         },
     }
     if lmcache:
-        overrides["omni_kv_config"] = {"kv_store_config": {"lmcache_config": {"config_file": ""}}}
-    return {"0": overrides}
+        thinker["omni_kv_config"] = {"kv_store_config": {"lmcache_config": {"config_file": ""}}}
+    return {
+        "0": thinker,
+        "1": {"devices": "0", "gpu_memory_utilization": 0.1, "enforce_eager": True},
+        "2": {"devices": "0", "gpu_memory_utilization": 0.05, "enforce_eager": True},
+    }
 
 
 def _prompts(n: int = 3) -> list[dict]:
@@ -81,7 +90,7 @@ def _run(*, lmcache: bool, prefix_caching: bool, rounds: int, gpu_memory_utiliza
 
     omni = Omni(
         model=DEFAULT_MODEL,
-        stage_overrides=_thinker_overrides(
+        stage_overrides=_stage_overrides(
             lmcache=lmcache,
             prefix_caching=prefix_caching,
             gpu_memory_utilization=gpu_memory_utilization,
