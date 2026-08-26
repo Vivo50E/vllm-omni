@@ -1,17 +1,11 @@
-"""
-E2E accuracy guard for the LMCache KV + hidden-state offload path.
+"""E2E accuracy guard for the LMCache KV + hidden-state offload path.
 
-The offload path only pays off when a later request skips prefill for a cached
-prefix. That shortcut is only safe if the restored KV *and* the restored hidden
-states reproduce what a fresh prefill would have produced -- the talker consumes
-the thinker's hidden states for the whole sequence, so a hole or a misplaced row
-in the restored prefix silently degrades audio without failing anything.
+A cache hit skips prefill, so the restored KV and hidden states must reproduce
+what a fresh prefill would have produced -- otherwise the talker is conditioned
+on a hole and audio degrades silently.
 
-This test pins that: the same prompts are decoded greedily with a fixed seed on
-a plain baseline (no LMCache, no in-GPU prefix cache) and on the offload config
-(LMCache + prefix caching, i.e. the combination several deploy profiles ship),
-where a second round is served from cache. The outputs must match token for
-token.
+Runs the same prompts with and without LMCache, both with the in-GPU prefix
+cache on so LMCache is the only variable, and requires identical output.
 """
 
 import pytest
@@ -29,11 +23,9 @@ SHARED_PREFIX = " ".join(
 
 
 def _stage_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilization: float) -> dict:
-    """Patch the thinker stage and keep the model's default talker/code2wav
-    stages, since audio is what the hidden-state restore path feeds.
+    """Patch the thinker; keep the default talker/code2wav stages so audio runs.
 
-    Every stage is pinned to device 0: the default deploy config spreads the
-    stages across two GPUs, and a 3B pipeline fits on one comfortably.
+    All stages are pinned to device 0 (the default config spreads them over two).
     """
     thinker: dict = {
         "max_model_len": 1024,
@@ -52,12 +44,8 @@ def _stage_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilizat
     }
     if lmcache:
         thinker["omni_kv_config"] = {"kv_store_config": {"lmcache_config": {"config_file": ""}}}
-    # The talker ships with temperature 0.9 / top_p 0.8 / top_k 40. Under
-    # sampling, the float-level differences that prefix caching legitimately
-    # introduces (a cached prefix skips prefill, so attention is computed over
-    # different chunk boundaries) flip a code and the audio diverges for reasons
-    # that have nothing to do with the restore path. Pin every stage to greedy
-    # so a mismatch actually means the restored state was wrong.
+    # The talker defaults to temperature 0.9, which amplifies any float-level
+    # difference into a different audio sequence.
     greedy = {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "seed": 42, "max_tokens": 48}
     return {
         "0": thinker,
@@ -89,13 +77,8 @@ def _prompts(n: int = 3) -> list[dict]:
 
 
 def _collect(omni, prompts) -> dict[str, dict]:
-    """Run one round and index text/audio by prompt.
-
-    Request ids are per-engine, so keying on them would pair a prompt's baseline
-    output with a different prompt's cached output. Text outputs carry the
-    prompt, so use that to resolve each request id to the prompt that produced
-    it, and key the results on the prompt itself.
-    """
+    """Run one round, keyed by prompt -- request ids are per-engine and would
+    pair one prompt's baseline output with another's cached output."""
     by_request: dict[str, dict] = {}
     prompt_of: dict[str, str] = {}
     for out in omni.generate(prompts, omni.default_sampling_params_list):
@@ -148,18 +131,17 @@ def _audio_len(entry: dict) -> int:
 
 
 @pytest.mark.parametrize("gpu_memory_utilization", [0.8])
-def test_kv_offload_matches_uncached_baseline(gpu_memory_utilization):
-    """A cache-served round must reproduce the uncached baseline exactly."""
+def test_kv_offload_matches_prefix_cached_baseline(gpu_memory_utilization):
+    """Adding LMCache offload must not change what a cache hit produces."""
     pytest.importorskip("lmcache", reason="lmcache not installed")
 
+    # Round 1 populates the cache; round 2 is served from it.
     baseline = _run(
         lmcache=False,
-        prefix_caching=False,
-        rounds=1,
+        prefix_caching=True,
+        rounds=2,
         gpu_memory_utilization=gpu_memory_utilization,
     )
-    # Round 1 populates LMCache; round 2 is served from the cached prefix, so it
-    # exercises the KV + hidden-state restore path.
     cached = _run(
         lmcache=True,
         prefix_caching=True,
@@ -171,8 +153,7 @@ def test_kv_offload_matches_uncached_baseline(gpu_memory_utilization):
     assert cached, "offload run produced no output"
     assert set(baseline) == set(cached), "the two runs answered different prompts"
 
-    # Audio is the signal that actually depends on restored hidden states: the
-    # talker is conditioned on the thinker's HS for the cached prefix too.
+    # Audio is what actually depends on the restored hidden states.
     assert any(_audio_len(e) for e in baseline.values()), (
         "baseline produced no audio; the HS restore path is untested without it"
     )
@@ -182,8 +163,6 @@ def test_kv_offload_matches_uncached_baseline(gpu_memory_utilization):
         assert got["text"] == want["text"], (
             f"prompt {i}: text diverged after restore\nbaseline={want['text']!r}\ncached={got['text']!r}"
         )
-        # An empty cached waveform means the talker was handed conditioning it
-        # could not decode -- the exact failure a bad HS restore produces.
         assert _audio_len(got) == _audio_len(want), (
             f"prompt {i}: audio length differs after restore "
             f"({_audio_len(want)} -> {_audio_len(got)}); an empty cached waveform means "
