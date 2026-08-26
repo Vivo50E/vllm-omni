@@ -89,15 +89,30 @@ def _prompts(n: int = 3) -> list[dict]:
 
 
 def _collect(omni, prompts) -> dict[str, dict]:
-    """Run one round and index text/audio by request id."""
-    results: dict[str, dict] = {}
+    """Run one round and index text/audio by prompt.
+
+    Request ids are per-engine, so keying on them would pair a prompt's baseline
+    output with a different prompt's cached output. Text outputs carry the
+    prompt, so use that to resolve each request id to the prompt that produced
+    it, and key the results on the prompt itself.
+    """
+    by_request: dict[str, dict] = {}
+    prompt_of: dict[str, str] = {}
     for out in omni.generate(prompts, omni.default_sampling_params_list):
-        entry = results.setdefault(out.request_id, {})
+        entry = by_request.setdefault(out.request_id, {})
         if out.final_output_type == "text":
             entry["text"] = out.outputs[0].text
+            if getattr(out, "prompt", None):
+                prompt_of[out.request_id] = out.prompt
         elif out.final_output_type == "audio":
             audio = out.outputs[0].multimodal_output["audio"]
             entry["audio"] = audio.detach().cpu().float()
+
+    results: dict[str, dict] = {}
+    for rid, entry in by_request.items():
+        key = prompt_of.get(rid)
+        assert key is not None, f"no text output (and therefore no prompt) for request {rid}"
+        results[key] = entry
     return results
 
 
@@ -127,9 +142,9 @@ def _run(*, lmcache: bool, prefix_caching: bool, rounds: int, gpu_memory_utiliza
         omni.close()
 
 
-def _sorted_values(results: dict[str, dict], key: str) -> list:
-    """Request ids differ across engines, so compare in prompt-completion order."""
-    return [results[rid][key] for rid in sorted(results) if key in results[rid]]
+def _audio_len(entry: dict) -> int:
+    audio = entry.get("audio")
+    return 0 if audio is None else int(audio.numel())
 
 
 @pytest.mark.parametrize("gpu_memory_utilization", [0.8])
@@ -154,19 +169,27 @@ def test_kv_offload_matches_uncached_baseline(gpu_memory_utilization):
 
     assert baseline, "baseline produced no output"
     assert cached, "offload run produced no output"
-    assert len(baseline) == len(cached), f"request count differs: {len(baseline)} vs {len(cached)}"
+    assert set(baseline) == set(cached), "the two runs answered different prompts"
 
-    base_text = _sorted_values(baseline, "text")
-    cached_text = _sorted_values(cached, "text")
-    assert base_text, "baseline produced no text output"
-    assert cached_text == base_text, f"text diverged after restore:\nbaseline={base_text}\ncached={cached_text}"
-
-    base_audio = _sorted_values(baseline, "audio")
-    cached_audio = _sorted_values(cached, "audio")
     # Audio is the signal that actually depends on restored hidden states: the
     # talker is conditioned on the thinker's HS for the cached prefix too.
-    assert base_audio, "baseline produced no audio; the HS restore path is untested without it"
-    assert len(cached_audio) == len(base_audio), "audio request count differs"
-    for i, (want, got) in enumerate(zip(base_audio, cached_audio)):
-        assert got.shape == want.shape, f"audio {i} length differs: {tuple(want.shape)} vs {tuple(got.shape)}"
-        assert torch.allclose(got, want, atol=1e-3, rtol=1e-3), f"audio {i} diverged after hidden-state restore"
+    assert any(_audio_len(e) for e in baseline.values()), (
+        "baseline produced no audio; the HS restore path is untested without it"
+    )
+
+    for i, prompt in enumerate(sorted(baseline)):
+        want, got = baseline[prompt], cached[prompt]
+        assert got["text"] == want["text"], (
+            f"prompt {i}: text diverged after restore\nbaseline={want['text']!r}\ncached={got['text']!r}"
+        )
+        # An empty cached waveform means the talker was handed conditioning it
+        # could not decode -- the exact failure a bad HS restore produces.
+        assert _audio_len(got) == _audio_len(want), (
+            f"prompt {i}: audio length differs after restore "
+            f"({_audio_len(want)} -> {_audio_len(got)}); an empty cached waveform means "
+            "the talker produced no codes for stage-2"
+        )
+        if _audio_len(want):
+            assert torch.allclose(got["audio"], want["audio"], atol=1e-3, rtol=1e-3), (
+                f"prompt {i}: audio diverged after hidden-state restore"
+            )
