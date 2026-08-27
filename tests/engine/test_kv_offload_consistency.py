@@ -58,7 +58,9 @@ _FACTS = [
 SHARED_PREFIX = " ".join(f"Fact {i}: {fact}" for i, fact in enumerate(_FACTS))
 
 
-def _stage_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilization: float) -> dict:
+def _stage_overrides(
+    *, lmcache: bool, prefix_caching: bool, gpu_memory_utilization: float, hidden_states: bool = True
+) -> dict:
     """Patch the thinker; keep the default talker/code2wav stages so audio runs.
 
     All stages are pinned to device 0 (the default config spreads them over two).
@@ -79,7 +81,10 @@ def _stage_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilizat
         },
     }
     if lmcache:
-        thinker["omni_kv_config"] = {"kv_store_config": {"lmcache_config": {"config_file": ""}}}
+        lmcache_config: dict = {"config_file": ""}
+        if not hidden_states:
+            lmcache_config["enable_hidden_state_cache"] = False
+        thinker["omni_kv_config"] = {"kv_store_config": {"lmcache_config": lmcache_config}}
     # The talker defaults to temperature 0.9, which amplifies any float-level
     # difference into a different audio sequence.
     greedy = {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "seed": 42, "max_tokens": 48}
@@ -135,7 +140,14 @@ def _collect(omni, prompts) -> dict[str, dict]:
     return results
 
 
-def _run(*, lmcache: bool, prefix_caching: bool, rounds: int, gpu_memory_utilization: float) -> dict[str, dict]:
+def _run(
+    *,
+    lmcache: bool,
+    prefix_caching: bool,
+    rounds: int,
+    gpu_memory_utilization: float,
+    hidden_states: bool = True,
+) -> dict[str, dict]:
     """Build an engine, run ``rounds`` identical rounds, return the last one."""
     from vllm_omni.entrypoints.omni import Omni
 
@@ -145,6 +157,7 @@ def _run(*, lmcache: bool, prefix_caching: bool, rounds: int, gpu_memory_utiliza
             lmcache=lmcache,
             prefix_caching=prefix_caching,
             gpu_memory_utilization=gpu_memory_utilization,
+            hidden_states=hidden_states,
         ),
         trust_remote_code=True,
         stage_init_timeout=600,
@@ -184,9 +197,14 @@ def _restore_marker():
 
 
 @pytest.mark.parametrize("gpu_memory_utilization", [0.8])
+@pytest.mark.parametrize("hidden_states", [False, True], ids=["kv_only", "kv_and_hs"])
 @pytest.mark.parametrize("prefix_caching", [False, True], ids=["lmcache_only", "with_prefix_cache"])
-def test_kv_offload_matches_baseline(prefix_caching, gpu_memory_utilization):
-    """Adding LMCache offload must not change what a cache hit produces."""
+def test_kv_offload_matches_baseline(prefix_caching, hidden_states, gpu_memory_utilization):
+    """Adding LMCache offload must not change what a cache hit produces.
+
+    The kv_only case turns the hidden-state store off, so a failure there is in
+    LMCache's KV restore rather than in the hidden-state path this PR adds.
+    """
     pytest.importorskip("lmcache", reason="lmcache not installed")
 
     # Round 1 populates the cache; round 2 is served from it.
@@ -202,10 +220,11 @@ def test_kv_offload_matches_baseline(prefix_caching, gpu_memory_utilization):
             prefix_caching=prefix_caching,
             rounds=2,
             gpu_memory_utilization=gpu_memory_utilization,
+            hidden_states=hidden_states,
         )
         restores = marker.read_text().splitlines() if marker.exists() else []
 
-    if not prefix_caching:
+    if hidden_states and not prefix_caching:
         # Without the in-GPU prefix cache every restored token comes from
         # LMCache, so num_computed matches what it holds and the prepend runs.
         # With it on, num_computed also covers in-GPU blocks and the length
