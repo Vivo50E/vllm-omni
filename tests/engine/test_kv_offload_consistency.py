@@ -13,6 +13,11 @@ autoregressively, so any float-level difference flips a code and the audio
 diverges. Enabling the in-GPU prefix cache alone already moves it.
 """
 
+import os
+import pathlib
+import tempfile
+from contextlib import contextmanager
+
 import pytest
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
@@ -134,24 +139,51 @@ def _audio_len(entry: dict) -> int:
     return 0 if audio is None else int(audio.numel())
 
 
+@contextmanager
+def _restore_marker():
+    """Point the runner's restore hook at a temp file so the test can tell
+    whether a hidden-state restore actually happened."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "restores.tsv"
+        previous = os.environ.get("OMNI_HS_RESTORE_MARKER_PATH")
+        os.environ["OMNI_HS_RESTORE_MARKER_PATH"] = str(path)
+        try:
+            yield path
+        finally:
+            if previous is None:
+                os.environ.pop("OMNI_HS_RESTORE_MARKER_PATH", None)
+            else:
+                os.environ["OMNI_HS_RESTORE_MARKER_PATH"] = previous
+
+
 @pytest.mark.parametrize("gpu_memory_utilization", [0.8])
-def test_kv_offload_matches_prefix_cached_baseline(gpu_memory_utilization):
+@pytest.mark.parametrize("prefix_caching", [False, True], ids=["lmcache_only", "with_prefix_cache"])
+def test_kv_offload_matches_baseline(prefix_caching, gpu_memory_utilization):
     """Adding LMCache offload must not change what a cache hit produces."""
     pytest.importorskip("lmcache", reason="lmcache not installed")
 
     # Round 1 populates the cache; round 2 is served from it.
     baseline = _run(
         lmcache=False,
-        prefix_caching=True,
+        prefix_caching=prefix_caching,
         rounds=2,
         gpu_memory_utilization=gpu_memory_utilization,
     )
-    cached = _run(
-        lmcache=True,
-        prefix_caching=True,
-        rounds=2,
-        gpu_memory_utilization=gpu_memory_utilization,
-    )
+    with _restore_marker() as marker:
+        cached = _run(
+            lmcache=True,
+            prefix_caching=prefix_caching,
+            rounds=2,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        restores = marker.read_text().splitlines() if marker.exists() else []
+
+    if not prefix_caching:
+        # Without the in-GPU prefix cache every restored token comes from
+        # LMCache, so num_computed matches what it holds and the prepend runs.
+        # With it on, num_computed also covers in-GPU blocks and the length
+        # check makes the restore bail out -- covered by the other case.
+        assert restores, "no hidden-state restore happened; the path under test never ran"
 
     assert baseline, "baseline produced no output"
     assert cached, "offload run produced no output"
