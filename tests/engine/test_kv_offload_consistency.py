@@ -24,11 +24,38 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-Omni-3B"
 
+_FACTS = [
+    "Mercury is the closest planet to the Sun and completes an orbit in about eighty-eight Earth days.",
+    "The Pacific is the largest ocean on Earth and covers roughly a third of the planet's surface.",
+    "Gold has the chemical symbol Au, taken from aurum, its name in Latin.",
+    "A regular hexagon has six equal sides and tiles the plane without leaving any gaps.",
+    "The Nile flows northward through Egypt and empties into the Mediterranean Sea.",
+    "Diamond is the hardest natural mineral and sits at the top of the Mohs scale.",
+    "Venus rotates in the opposite direction to most planets, so the Sun there rises in the west.",
+    "The Amazon carries more water than any other river and drains a basin shared by several countries.",
+    "Helium is lighter than air, which is why a balloon filled with it floats upward.",
+    "An octave spans eight notes and doubles the frequency between its first and last pitch.",
+    "Antarctica is the driest continent and most of it receives less precipitation than a desert.",
+    "Copper conducts electricity better than iron, which is why household wiring uses it.",
+    "The Sahara is the largest hot desert and stretches across much of northern Africa.",
+    "Water boils at one hundred degrees Celsius at sea level, and lower where the pressure drops.",
+    "A leap year has three hundred and sixty-six days because February gains an extra one.",
+    "Everest is the highest mountain above sea level and sits on the border of Nepal and Tibet.",
+    "Silver is the most reflective metal, which makes it useful for mirrors and telescopes.",
+    "The Dead Sea lies below sea level and is salty enough that swimmers float without effort.",
+    "Bamboo is the fastest growing plant and some species gain most of a metre in a day.",
+    "Neon glows red in a discharge tube, which is where the classic sign colour comes from.",
+    "The Baltic is the least salty sea because so many rivers empty fresh water into it.",
+    "Graphite and diamond are both pure carbon and differ only in how their atoms are arranged.",
+    "Jupiter has the shortest day of the planets and turns once in under ten hours.",
+    "Mount Fuji is the highest peak in Japan and last erupted in the early eighteenth century.",
+]
+
 # Long enough to span several LMCache chunks so a cache hit actually skips
 # prefill; shared by every prompt so later requests hit the cached prefix.
-SHARED_PREFIX = " ".join(
-    f"Reference item {i}: the quick brown fox jumps over the lazy dog number {i}." for i in range(24)
-)
+# The facts are deliberately unrelated: near-identical candidates leave the
+# greedy argmax nearly tied, so any float-level difference flips the answer.
+SHARED_PREFIX = " ".join(f"Fact {i}: {fact}" for i, fact in enumerate(_FACTS))
 
 
 def _stage_overrides(*, lmcache: bool, prefix_caching: bool, gpu_memory_utilization: float) -> dict:
@@ -77,8 +104,8 @@ def _prompts(n: int = 3) -> list[dict]:
     return [
         {
             "prompt": (
-                f"<|im_start|>user\n{SHARED_PREFIX}\nUsing only the list above, "
-                f"state item {i} verbatim.<|im_end|>\n<|im_start|>assistant\n"
+                f"<|im_start|>user\n{SHARED_PREFIX}\nRepeat Fact {i} above word for "
+                f"word.<|im_end|>\n<|im_start|>assistant\n"
             )
         }
         for i in range(n)
