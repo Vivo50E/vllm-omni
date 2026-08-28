@@ -868,11 +868,15 @@ class GPUARModelRunner(
             for layer_idx, kv in enumerate(self.kv_caches):
                 if not isinstance(kv, torch.Tensor) or kv.dim() < 3:
                     continue
-                # kv is [2, num_blocks, block_size, ...]. Index the block and
-                # in-block dims directly: flattening them needs a reshape, and
-                # the cache is not contiguous across that pair.
+                # Layout is [num_blocks, 2, block_size, ...]: block dim first,
+                # in-block dim third. Pair them as advanced indices so only the
+                # selected rows are materialised -- slicing the block dim
+                # instead keeps all of it and asks for tens of GiB.
+                if kv.shape[2] != block_size:
+                    logger.info("[kvfp] layer %d has an unexpected layout %s", layer_idx, tuple(kv.shape))
+                    return
                 try:
-                    rows = kv[:, block_ids.to(kv.device), offsets.to(kv.device)].float()
+                    rows = kv[block_ids.to(kv.device), :, offsets.to(kv.device)].float()
                 except Exception as exc:  # noqa: BLE001 - debug probe
                     logger.info("[kvfp] layer %d not indexable (%s): %s", layer_idx, tuple(kv.shape), exc)
                     return
