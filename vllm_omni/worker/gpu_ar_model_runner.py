@@ -838,7 +838,15 @@ class GPUARModelRunner(
         restored prefix is visible before this step overwrites anything;
         ``post`` runs after, which is where a cold round's prefix lands.
         """
-        span = int(os.environ.get("OMNI_DEBUG_KV_FINGERPRINT", "512"))
+        # "span" or "span:split" -- with a split the range is reported as two
+        # segments, [0, split) and [split, span). Round 2 has the first segment
+        # restored by LMCache and computes the second itself, so a zero element
+        # count on the first alone separates "nothing was written" from "written
+        # at the wrong offsets".
+        span_spec = os.environ.get("OMNI_DEBUG_KV_FINGERPRINT", "512")
+        span_text, _, split_text = span_spec.partition(":")
+        span = int(span_text)
+        split = int(split_text) if split_text else span
         if not self.kv_caches:
             logger.info("[kvfp] no kv_caches on this runner")
             return
@@ -865,6 +873,9 @@ class GPUARModelRunner(
             block_ids = block_table[req_idx, block_offsets].to(torch.long)
             offsets = positions % block_size
             per_layer = []
+            seg_sum = [0.0, 0.0]
+            seg_nonzero = [0, 0]
+            seg_elems = [0, 0]
             for layer_idx, kv in enumerate(self.kv_caches):
                 if not isinstance(kv, torch.Tensor) or kv.dim() < 3:
                     continue
@@ -881,11 +892,21 @@ class GPUARModelRunner(
                     logger.info("[kvfp] layer %d not indexable (%s): %s", layer_idx, tuple(kv.shape), exc)
                     return
                 per_layer.append((layer_idx, float(rows.sum().item()), float(rows.abs().max().item())))
+                for seg, part in enumerate((rows[:split], rows[split:])):
+                    if part.numel() == 0:
+                        continue
+                    seg_sum[seg] += float(part.sum().item())
+                    seg_nonzero[seg] += int((part != 0).sum().item())
+                    seg_elems[seg] += int(part.numel())
             head = ", ".join(f"L{i}:sum={s:.4f},max={m:.4f}" for i, s, m in per_layer[:3])
             total = sum(s for _, s, _ in per_layer)
+            segments = " ".join(
+                f"[{lo},{hi}):sum={seg_sum[i]:.4f},nonzero={seg_nonzero[i]}/{seg_elems[i]}"
+                for i, (lo, hi) in enumerate(((0, split), (split, span)))
+            )
             logger.info(
                 "[kvfp] %s req=%s covered=%d blocks[:4]=%s slots[:4]=%s layers=%d/%d "
-                "kv0.shape=%s kv0.stride=%s kv0.ptr=%s total_sum=%.4f | %s",
+                "kv0.shape=%s kv0.stride=%s kv0.ptr=%s total_sum=%.4f | %s | %s",
                 phase,
                 req_id,
                 covered,
@@ -897,6 +918,7 @@ class GPUARModelRunner(
                 tuple(self.kv_caches[0].stride()),
                 hex(self.kv_caches[0].data_ptr()),
                 total,
+                segments,
                 head,
             )
 
