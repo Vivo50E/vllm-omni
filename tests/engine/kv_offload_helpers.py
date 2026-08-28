@@ -66,6 +66,7 @@ def stage_overrides(
     hidden_states: bool = True,
     thinker_extra: dict | None = None,
     downstream_extra: dict[str, dict] | None = None,
+    lmcache_extra: dict | None = None,
 ) -> dict:
     """Patch the thinker; keep the default talker/code2wav stages so audio runs.
 
@@ -84,7 +85,7 @@ def stage_overrides(
         **(thinker_extra or {}),
     }
     if lmcache:
-        lmcache_config: dict = {"config_file": ""}
+        lmcache_config: dict = {"config_file": "", **(lmcache_extra or {})}
         if not hidden_states:
             lmcache_config["enable_hidden_state_cache"] = False
         thinker["omni_kv_config"] = {"kv_store_config": {"lmcache_config": lmcache_config}}
