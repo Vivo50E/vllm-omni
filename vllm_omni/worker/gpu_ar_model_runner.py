@@ -829,6 +829,55 @@ class GPUARModelRunner(
         )
         return hidden_states_cpu, combined_hidden_states, combined_multimodal_outputs
 
+    def _debug_log_kv_fingerprint(self, scheduler_output, phase: str) -> None:
+        """Temporary probe: fingerprint the KV backing a fixed prefix range.
+
+        Enabled by OMNI_DEBUG_KV_FINGERPRINT (the range length, default 512).
+        Round 1 computes that prefix, round 2 has it restored from LMCache, so
+        the two fingerprints must agree. ``pre`` runs before the forward, so a
+        restored prefix is visible before this step overwrites anything;
+        ``post`` runs after, which is where a cold round's prefix lands.
+        """
+        span = int(os.environ.get("OMNI_DEBUG_KV_FINGERPRINT", "512"))
+        prefix_cache = self.omni_prefix_cache
+        if prefix_cache is None or not self.kv_caches:
+            logger.info("[kvfp] no prefix cache or kv_caches; cannot resolve slots")
+            return
+        for req_id in self.input_batch.req_ids:
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            # Only once the range is actually backed: already computed for a
+            # restored round, or written by this very step for a cold one.
+            available = num_computed + (scheduled if phase == "post" else 0)
+            if available < span:
+                continue
+            covered = span
+            slots = prefix_cache._get_slot_ids_for_token_range(req_idx, self.input_batch, 0, covered)
+            if slots.numel() == 0:
+                continue
+            per_layer = []
+            for layer_idx, kv in enumerate(self.kv_caches):
+                if not isinstance(kv, torch.Tensor):
+                    continue
+                # kv is [2, num_blocks, block_size, ...]; flatten the block/slot
+                # dims so a slot id indexes rows directly.
+                flat = kv.view(kv.shape[0], -1, *kv.shape[3:]) if kv.dim() > 3 else kv
+                rows = flat[:, slots.to(flat.device)].float()
+                per_layer.append((layer_idx, float(rows.sum().item()), float(rows.abs().max().item())))
+            head = ", ".join(f"L{i}:sum={s:.4f},max={m:.4f}" for i, s, m in per_layer[:3])
+            total = sum(s for _, s, _ in per_layer)
+            logger.info(
+                "[kvfp] %s req=%s covered=%d slots[:4]=%s layers=%d total_sum=%.4f | %s",
+                phase,
+                req_id,
+                covered,
+                slots[:4].tolist(),
+                len(per_layer),
+                total,
+                head,
+            )
+
     def _debug_log_forward_inputs(self, scheduler_output, input_ids, positions) -> None:
         """Temporary probe: what the model is actually asked to compute.
 
@@ -1309,6 +1358,8 @@ class GPUARModelRunner(
 
                 if os.environ.get("OMNI_DEBUG_FORWARD_INPUTS"):
                     self._debug_log_forward_inputs(scheduler_output, input_ids, positions)
+                if os.environ.get("OMNI_DEBUG_KV_FINGERPRINT"):
+                    self._debug_log_kv_fingerprint(scheduler_output, "pre")
 
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -1320,6 +1371,9 @@ class GPUARModelRunner(
                     logits_index=logits_indices,
                     sampler=self.sampler,
                 )
+
+                if os.environ.get("OMNI_DEBUG_KV_FINGERPRINT"):
+                    self._debug_log_kv_fingerprint(scheduler_output, "post")
 
                 # [Omni] Map pending ropes metadata to req_ids.
                 flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
