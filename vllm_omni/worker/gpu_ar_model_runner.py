@@ -884,12 +884,18 @@ class GPUARModelRunner(
             head = ", ".join(f"L{i}:sum={s:.4f},max={m:.4f}" for i, s, m in per_layer[:3])
             total = sum(s for _, s, _ in per_layer)
             logger.info(
-                "[kvfp] %s req=%s covered=%d blocks[:4]=%s layers=%d total_sum=%.4f | %s",
+                "[kvfp] %s req=%s covered=%d blocks[:4]=%s slots[:4]=%s layers=%d/%d "
+                "kv0.shape=%s kv0.stride=%s kv0.ptr=%s total_sum=%.4f | %s",
                 phase,
                 req_id,
                 covered,
                 block_ids[:4].tolist(),
+                (block_ids[:4] * block_size + offsets[:4]).tolist(),
                 len(per_layer),
+                len(self.kv_caches),
+                tuple(self.kv_caches[0].shape),
+                tuple(self.kv_caches[0].stride()),
+                hex(self.kv_caches[0].data_ptr()),
                 total,
                 head,
             )
