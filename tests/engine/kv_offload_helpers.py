@@ -119,8 +119,10 @@ def collect(omni, request_prompts) -> dict[str, dict]:
     return results
 
 
-def run(*, model: str, overrides: dict, rounds: int, init_timeout: int = 900) -> dict[str, dict]:
-    """Build an engine, run ``rounds`` identical rounds, return the last one."""
+def run_rounds(
+    *, model: str, overrides: dict, rounds: int, init_timeout: int = 900, num_prompts: int = 3
+) -> list[dict[str, dict]]:
+    """Build an engine, run ``rounds`` identical rounds, return each one."""
     from vllm_omni.entrypoints.omni import Omni
 
     omni = Omni(
@@ -132,13 +134,15 @@ def run(*, model: str, overrides: dict, rounds: int, init_timeout: int = 900) ->
         init_timeout=init_timeout,
     )
     try:
-        request_prompts = prompts()
-        last: dict[str, dict] = {}
-        for _ in range(rounds):
-            last = collect(omni, request_prompts)
-        return last
+        request_prompts = prompts(num_prompts)
+        return [collect(omni, request_prompts) for _ in range(rounds)]
     finally:
         omni.close()
+
+
+def run(*, model: str, overrides: dict, rounds: int, init_timeout: int = 900) -> dict[str, dict]:
+    """Build an engine, run ``rounds`` identical rounds, return the last one."""
+    return run_rounds(model=model, overrides=overrides, rounds=rounds, init_timeout=init_timeout)[-1]
 
 
 def audio_len(entry: dict) -> int:
