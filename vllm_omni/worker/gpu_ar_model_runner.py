@@ -7,6 +7,7 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
+import os
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
@@ -828,6 +829,48 @@ class GPUARModelRunner(
         )
         return hidden_states_cpu, combined_hidden_states, combined_multimodal_outputs
 
+    def _debug_log_forward_inputs(self, scheduler_output, input_ids, positions) -> None:
+        """Temporary probe: what the model is actually asked to compute.
+
+        Enabled by OMNI_DEBUG_FORWARD_INPUTS. Shows, per request, how many
+        tokens the engine considers already computed and which token ids are
+        being fed this step -- enough to tell whether a cache hit left the
+        trailing prompt tokens unprocessed.
+        """
+        for req_id in self.input_batch.req_ids:
+            sched = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if sched <= 0:
+                continue
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            start = int(self.query_start_loc.cpu[req_idx])
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            num_prompt = int(self.input_batch.num_prompt_tokens[req_idx])
+            fed = input_ids[start : start + sched].tolist() if input_ids is not None else []
+            pos = positions[..., start : start + sched]
+            pos_head = pos[..., :4].tolist() if pos.ndim > 1 else pos[:4].tolist()
+            pos_tail = pos[..., -4:].tolist() if pos.ndim > 1 else pos[-4:].tolist()
+            logger.info(
+                "[probe] req=%s prompt=%d computed=%d scheduled=%d | fed_ids[:8]=%s fed_ids[-8:]=%s "
+                "| pos_head=%s pos_tail=%s",
+                req_id,
+                num_prompt,
+                num_computed,
+                sched,
+                fed[:8],
+                fed[-8:],
+                pos_head,
+                pos_tail,
+            )
+            expected_tail = self.input_batch.token_ids_cpu[req_idx, num_computed : num_computed + sched].tolist()
+            if fed and expected_tail and fed != expected_tail:
+                logger.error(
+                    "[probe] req=%s fed ids do not match token_ids_cpu[%d:%d]; expected[-8:]=%s",
+                    req_id,
+                    num_computed,
+                    num_computed + sched,
+                    expected_tail[-8:],
+                )
+
     def _build_omni_pooler_payload(
         self,
         *,
@@ -1263,6 +1306,9 @@ class GPUARModelRunner(
                 # Restore HS from LMCache after KV load (start_load_kv already ran)
                 if get_pp_group().is_last_rank:
                     self._maybe_restore_hs_from_lmcache(scheduler_output)
+
+                if os.environ.get("OMNI_DEBUG_FORWARD_INPUTS"):
+                    self._debug_log_forward_inputs(scheduler_output, input_ids, positions)
 
                 model_output = self._model_forward(
                     input_ids=input_ids,
