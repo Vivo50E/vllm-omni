@@ -30,21 +30,25 @@ _DOWNSTREAM = {
 }
 
 
-@pytest.mark.parametrize("lmcache", [False, True], ids=["no_lmcache", "lmcache"])
-def test_second_round_matches_first(lmcache):
+@pytest.mark.parametrize("mode", ["off", "kv_only", "kv_and_hs"])
+def test_second_round_matches_first(mode):
     """Round 2 must answer exactly what round 1 answered.
 
-    The no_lmcache case is the control: it shows whether repeating a prompt is
-    stable at all in this pipeline, so a failure in the lmcache case can be
-    attributed to the cache hit.
+    ``off`` is the control: it shows whether repeating a prompt is stable at all
+    here, so a failure elsewhere can be attributed to the cache hit.
+
+    ``kv_only`` disables the hidden-state store. Text is produced by the thinker,
+    which reads KV and not hidden states, so text still diverging there puts the
+    fault in LMCache's KV restore rather than in the hidden-state path.
     """
     pytest.importorskip("lmcache", reason="lmcache not installed")
 
     rounds = helpers.run_rounds(
         model=MODEL,
         overrides=helpers.stage_overrides(
-            lmcache=lmcache,
+            lmcache=mode != "off",
             prefix_caching=False,
+            hidden_states=mode == "kv_and_hs",
             thinker_extra=_THINKER,
             downstream_extra=_DOWNSTREAM,
         ),
