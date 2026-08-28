@@ -17,10 +17,17 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
 MODEL = "Qwen/Qwen2.5-Omni-3B"
 
 # 3B fits on one card, so pin every stage there; the default config spreads them.
-_THINKER = {"max_model_len": 1024, "max_num_batched_tokens": 1024, "gpu_memory_utilization": 0.8, "devices": "0"}
+_THINKER = {
+    "max_model_len": 1024,
+    "max_num_batched_tokens": 1024,
+    "gpu_memory_utilization": 0.8,
+    "devices": "0",
+    "enforce_eager": True,
+    "async_chunk": False,
+}
 _DOWNSTREAM = {
-    "1": {"devices": "0", "gpu_memory_utilization": 0.1},
-    "2": {"devices": "0", "gpu_memory_utilization": 0.05},
+    "1": {"devices": "0", "gpu_memory_utilization": 0.1, "enforce_eager": True},
+    "2": {"devices": "0", "gpu_memory_utilization": 0.05, "enforce_eager": True},
 }
 
 

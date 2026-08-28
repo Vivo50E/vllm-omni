@@ -74,11 +74,12 @@ def stage_overrides(
     any float-level difference into a different audio sequence, so every stage
     is pinned to greedy here.
     """
+    # async_chunk and enforce_eager are left to the caller: Qwen3-Omni hands off
+    # to the talker through an async-chunk-specific processor, so forcing them
+    # breaks the handoff.
     thinker: dict = {
         "max_num_seqs": 4,
-        "enforce_eager": True,
         "enable_prefix_caching": prefix_caching,
-        "async_chunk": False,
         "default_sampling_params": dict(GREEDY),
         **(thinker_extra or {}),
     }
@@ -90,7 +91,7 @@ def stage_overrides(
 
     overrides: dict = {"0": thinker}
     for stage_id, extra in (downstream_extra or {}).items():
-        overrides[stage_id] = {"enforce_eager": True, "default_sampling_params": dict(GREEDY), **extra}
+        overrides[stage_id] = {"default_sampling_params": dict(GREEDY), **extra}
     return overrides
 
 

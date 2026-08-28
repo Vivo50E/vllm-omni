@@ -17,6 +17,9 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
+# async_chunk and enforce_eager are deliberately not overridden: the deploy
+# config runs async_chunk and hands off to the talker through
+# thinker2talker_async_chunk, so forcing them starves the talker of embeddings.
 _THINKER = {"max_model_len": 2048, "max_num_batched_tokens": 2048, "gpu_memory_utilization": 0.85}
 _DOWNSTREAM = {"1": {"gpu_memory_utilization": 0.3}, "2": {"gpu_memory_utilization": 0.2}}
 
