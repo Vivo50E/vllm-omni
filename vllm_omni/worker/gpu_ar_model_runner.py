@@ -862,17 +862,20 @@ class GPUARModelRunner(
             if available < span:
                 continue
             covered = span
-            slots = block_table[req_idx, block_offsets].to(torch.long) * block_size + (positions % block_size)
-            if slots.numel() == 0:
-                continue
+            block_ids = block_table[req_idx, block_offsets].to(torch.long)
+            offsets = positions % block_size
             per_layer = []
             for layer_idx, kv in enumerate(self.kv_caches):
-                if not isinstance(kv, torch.Tensor):
+                if not isinstance(kv, torch.Tensor) or kv.dim() < 3:
                     continue
-                # kv is [2, num_blocks, block_size, ...]; flatten the block/slot
-                # dims so a slot id indexes rows directly.
-                flat = kv.view(kv.shape[0], -1, *kv.shape[3:]) if kv.dim() > 3 else kv
-                rows = flat[:, slots.to(flat.device)].float()
+                # kv is [2, num_blocks, block_size, ...]. Index the block and
+                # in-block dims directly: flattening them needs a reshape, and
+                # the cache is not contiguous across that pair.
+                try:
+                    rows = kv[:, block_ids.to(kv.device), offsets.to(kv.device)].float()
+                except Exception as exc:  # noqa: BLE001 - debug probe
+                    logger.info("[kvfp] layer %d not indexable (%s): %s", layer_idx, tuple(kv.shape), exc)
+                    return
                 per_layer.append((layer_idx, float(rows.sum().item()), float(rows.abs().max().item())))
             head = ", ".join(f"L{i}:sum={s:.4f},max={m:.4f}" for i, s, m in per_layer[:3])
             total = sum(s for _, s, _ in per_layer)
@@ -1368,7 +1371,10 @@ class GPUARModelRunner(
                 if os.environ.get("OMNI_DEBUG_FORWARD_INPUTS"):
                     self._debug_log_forward_inputs(scheduler_output, input_ids, positions)
                 if os.environ.get("OMNI_DEBUG_KV_FINGERPRINT"):
-                    self._debug_log_kv_fingerprint(scheduler_output, "pre")
+                    try:
+                        self._debug_log_kv_fingerprint(scheduler_output, "pre")
+                    except Exception:  # noqa: BLE001 - a probe must not kill the engine
+                        logger.exception("[kvfp] probe failed")
 
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -1382,7 +1388,10 @@ class GPUARModelRunner(
                 )
 
                 if os.environ.get("OMNI_DEBUG_KV_FINGERPRINT"):
-                    self._debug_log_kv_fingerprint(scheduler_output, "post")
+                    try:
+                        self._debug_log_kv_fingerprint(scheduler_output, "post")
+                    except Exception:  # noqa: BLE001 - a probe must not kill the engine
+                        logger.exception("[kvfp] probe failed")
 
                 # [Omni] Map pending ropes metadata to req_ids.
                 flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
