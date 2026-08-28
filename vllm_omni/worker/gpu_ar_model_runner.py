@@ -839,10 +839,19 @@ class GPUARModelRunner(
         ``post`` runs after, which is where a cold round's prefix lands.
         """
         span = int(os.environ.get("OMNI_DEBUG_KV_FINGERPRINT", "512"))
-        prefix_cache = self.omni_prefix_cache
-        if prefix_cache is None or not self.kv_caches:
-            logger.info("[kvfp] no prefix cache or kv_caches; cannot resolve slots")
+        if not self.kv_caches:
+            logger.info("[kvfp] no kv_caches on this runner")
             return
+        # Resolved here rather than through the prefix cache: this probe has to
+        # work with prefix caching off, which is when omni_prefix_cache is None.
+        block_size = self.cache_config.block_size
+        block_table = self.input_batch.block_table[0].block_table.cpu
+        positions = torch.arange(span, dtype=torch.long)
+        block_offsets = positions // block_size
+        if int(block_offsets.max()) >= int(block_table.shape[1]):
+            logger.info("[kvfp] span %d exceeds the block table; skipping", span)
+            return
+
         for req_id in self.input_batch.req_ids:
             req_idx = self.input_batch.req_id_to_index[req_id]
             num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
@@ -853,7 +862,7 @@ class GPUARModelRunner(
             if available < span:
                 continue
             covered = span
-            slots = prefix_cache._get_slot_ids_for_token_range(req_idx, self.input_batch, 0, covered)
+            slots = block_table[req_idx, block_offsets].to(torch.long) * block_size + (positions % block_size)
             if slots.numel() == 0:
                 continue
             per_layer = []
