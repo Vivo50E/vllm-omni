@@ -829,6 +829,41 @@ class GPUARModelRunner(
         )
         return hidden_states_cpu, combined_hidden_states, combined_multimodal_outputs
 
+    def _debug_log_kv_block_map(self, phase: str) -> None:
+        """Temporary probe: report which blocks of layer 0 changed since last call.
+
+        A restore that reports success while the blocks the model reads stay zero
+        must have written somewhere else in the same allocation. Summing layer 0
+        per block and diffing against the previous call names that destination.
+        """
+        if os.environ.get("OMNI_DEBUG_KV_BLOCKMAP") != "1":
+            return
+        seen = getattr(self, "_kvfp_blockmap_calls", 0)
+        if seen >= 8:
+            return
+        self._kvfp_blockmap_calls = seen + 1
+        kv = self.kv_caches[0]
+        # dtype= rather than .float(): the cache is a multi-GiB non-contiguous
+        # view, so materialising a copy of it here would risk an OOM.
+        sums = kv.sum(dim=tuple(range(1, kv.dim())), dtype=torch.float32)
+        previous = getattr(self, "_kvfp_block_sums", None)
+        self._kvfp_block_sums = sums
+        if previous is None:
+            logger.info(
+                "[kvbm] %s baseline nonzero_blocks=%d",
+                phase,
+                int((sums != 0).sum().item()),
+            )
+            return
+        changed = torch.nonzero(sums != previous, as_tuple=False).flatten()
+        logger.info(
+            "[kvbm] %s changed_blocks=%d first=%s last=%s",
+            phase,
+            int(changed.numel()),
+            changed[:12].tolist(),
+            changed[-4:].tolist(),
+        )
+
     def _debug_log_kv_fingerprint(self, scheduler_output, phase: str) -> None:
         """Temporary probe: fingerprint the KV backing a fixed prefix range.
 
@@ -859,6 +894,8 @@ class GPUARModelRunner(
         if int(block_offsets.max()) >= int(block_table.shape[1]):
             logger.info("[kvfp] span %d exceeds the block table; skipping", span)
             return
+
+        self._debug_log_kv_block_map(phase)
 
         for req_id in self.input_batch.req_ids:
             req_idx = self.input_batch.req_id_to_index[req_id]
