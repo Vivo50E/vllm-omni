@@ -18,17 +18,20 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
 
 MODEL = "Qwen/Qwen2.5-Omni-3B"
 
+# Every stage shares one card; which card is overridable so two variants of
+# this test can occupy separate GPUs at the same time.
+_DEVICE = os.environ.get("OMNI_TEST_DEVICE", "0")
 _THINKER = {
     "max_model_len": 1024,
     "max_num_batched_tokens": 1024,
     "gpu_memory_utilization": 0.8,
-    "devices": "0",
+    "devices": _DEVICE,
     "enforce_eager": True,
     "async_chunk": False,
 }
 _DOWNSTREAM = {
-    "1": {"devices": "0", "gpu_memory_utilization": 0.1, "enforce_eager": True},
-    "2": {"devices": "0", "gpu_memory_utilization": 0.05, "enforce_eager": True},
+    "1": {"devices": _DEVICE, "gpu_memory_utilization": 0.1, "enforce_eager": True},
+    "2": {"devices": _DEVICE, "gpu_memory_utilization": 0.05, "enforce_eager": True},
 }
 
 
