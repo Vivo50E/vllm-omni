@@ -53,7 +53,7 @@ def test_second_round_matches_first(mode):
             downstream_extra=_DOWNSTREAM,
         ),
         rounds=2,
-        num_prompts=1,
+        num_prompts=3,
     )
     cold, served = rounds[0], rounds[1]
 
