@@ -839,9 +839,15 @@ class GPUARModelRunner(
         if os.environ.get("OMNI_DEBUG_KV_BLOCKMAP") != "1":
             return
         seen = getattr(self, "_kvfp_blockmap_calls", 0)
-        if seen >= 8:
+        if seen >= 4000:
             return
         self._kvfp_blockmap_calls = seen + 1
+        computed = [
+            int(self.input_batch.num_computed_tokens_cpu[
+                self.input_batch.req_id_to_index[r]
+            ])
+            for r in self.input_batch.req_ids
+        ]
         kv = self.kv_caches[0]
         # dtype= rather than .float(): the cache is a multi-GiB non-contiguous
         # view, so materialising a copy of it here would risk an OOM.
@@ -850,15 +856,21 @@ class GPUARModelRunner(
         self._kvfp_block_sums = sums
         if previous is None:
             logger.info(
-                "[kvbm] %s baseline nonzero_blocks=%d",
+                "[kvbm] %s nblocks=%d computed=%s baseline nonzero_blocks=%d",
                 phase,
+                kv.shape[0],
+                computed,
                 int((sums != 0).sum().item()),
             )
             return
         changed = torch.nonzero(sums != previous, as_tuple=False).flatten()
+        if changed.numel() == 0:
+            return
         logger.info(
-            "[kvbm] %s changed_blocks=%d first=%s last=%s",
+            "[kvbm] %s nblocks=%d computed=%s changed_blocks=%d first=%s last=%s",
             phase,
+            kv.shape[0],
+            computed,
             int(changed.numel()),
             changed[:12].tolist(),
             changed[-4:].tolist(),
