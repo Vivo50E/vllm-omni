@@ -6,11 +6,6 @@ Kept model-agnostic so each model gets its own test module with its own device
 layout and memory budget.
 """
 
-import os
-import pathlib
-import tempfile
-from contextlib import contextmanager
-
 _FACTS = [
     "Mercury is the closest planet to the Sun and completes an orbit in about eighty-eight Earth days.",
     "The Pacific is the largest ocean on Earth and covers roughly a third of the planet's surface.",
@@ -148,23 +143,6 @@ def run(*, model: str, overrides: dict, rounds: int, init_timeout: int = 900) ->
 def audio_len(entry: dict) -> int:
     audio = entry.get("audio")
     return 0 if audio is None else int(audio.numel())
-
-
-@contextmanager
-def restore_marker():
-    """Point the runner's restore hook at a temp file so a test can tell whether
-    a hidden-state restore actually happened."""
-    with tempfile.TemporaryDirectory() as tmp:
-        path = pathlib.Path(tmp) / "restores.tsv"
-        previous = os.environ.get("OMNI_HS_RESTORE_MARKER_PATH")
-        os.environ["OMNI_HS_RESTORE_MARKER_PATH"] = str(path)
-        try:
-            yield path
-        finally:
-            if previous is None:
-                os.environ.pop("OMNI_HS_RESTORE_MARKER_PATH", None)
-            else:
-                os.environ["OMNI_HS_RESTORE_MARKER_PATH"] = previous
 
 
 def compare(

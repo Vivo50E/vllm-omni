@@ -66,11 +66,7 @@ def test_lmcache_only_hit_does_not_serve_stale_hidden_states():
         _run(lmcache=True, disk=disk)
         # Fresh engine: nothing in the in-GPU cache, but LMCache still has the
         # prefix, so a hit here can only come from LMCache.
-        with helpers.restore_marker() as marker:
-            cached = _run(lmcache=True, disk=disk)
-            restores = marker.read_text().splitlines() if marker.exists() else []
-
-    print(f"hidden-state restores on the cold engine: {len(restores)}")
+        cached = _run(lmcache=True, disk=disk)
 
     assert baseline, "baseline produced no output"
     assert cached, "offload run produced no output"

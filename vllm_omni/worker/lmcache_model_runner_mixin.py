@@ -7,8 +7,6 @@ keeps thin no-op hooks (``_setup_lmcache_hidden_state_offload`` and
 ``_drop_hs_pending_state``) so non-AR runners carry none of this.
 """
 
-import os
-
 import torch
 from vllm.logger import init_logger
 
@@ -202,17 +200,6 @@ class LMCacheHiddenStateMixin:
         if restored_mm is not None:
             restored_mm.pop(req_id, None)
 
-    def _maybe_write_hs_restore_marker(self, req_id: str, num_computed: int, layers: dict) -> None:
-        """Test-only hook: record a restore event when OMNI_HS_RESTORE_MARKER_PATH is set."""
-        marker_path = os.environ.get("OMNI_HS_RESTORE_MARKER_PATH")
-        if not marker_path:
-            return
-        try:
-            with open(marker_path, "a", encoding="utf-8") as fp:
-                fp.write(f"{req_id}\t{num_computed}\t{','.join(sorted(layers.keys()))}\n")
-        except OSError:
-            pass
-
     def _maybe_restore_hs_from_lmcache(self, scheduler_output=None):
         """Restore per-layer hidden states from LMCache for KV-hit new requests.
 
@@ -290,7 +277,6 @@ class LMCacheHiddenStateMixin:
                 num_computed,
                 list(layers.keys()),
             )
-            self._maybe_write_hs_restore_marker(req_id, num_computed, layers)
             # mm layers use the flattened payload key; "hidden" stays as-is.
             remapped = {(lk if lk == "hidden" else f"hidden_states.layer_{lk}"): hs for lk, hs in layers.items()}
             # Exactly one consumer: the merge already picks up the slots we
