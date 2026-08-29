@@ -51,7 +51,11 @@ def test_second_round_matches_first(mode):
 
     ``kv_only`` disables the hidden-state store. Text is produced by the thinker,
     which reads KV and not hidden states, so text still diverging there puts the
-    fault in LMCache's KV restore rather than in the hidden-state path.
+    fault in LMCache's KV restore rather than in the hidden-state path. Audio is
+    then required to be *absent*: the hit skips the prefill that would have
+    produced the hidden states, and with no store to restore them from, the
+    talker has nothing to condition on. That arm is what shows the hidden-state
+    offload is load-bearing rather than an optimisation.
     """
     pytest.importorskip("lmcache", reason="lmcache not installed")
 
@@ -79,5 +83,5 @@ def test_second_round_matches_first(mode):
     assert cold and served, "a round produced no output"
     assert set(cold) == set(served), "the two rounds answered different prompts"
 
-    problems = helpers.compare(cold, served)
+    problems = helpers.compare(cold, served, expect_audio=mode != "kv_only")
     assert not problems, "round 2 diverged from this engine's own cold round:\n" + "\n".join(problems)

@@ -59,8 +59,11 @@ def _run(*, lmcache: bool, prefix_caching: bool, rounds: int, hidden_states: boo
 def test_kv_offload_matches_baseline(prefix_caching, hidden_states):
     """Adding LMCache offload must not change what a cache hit produces.
 
-    The kv_only case turns the hidden-state store off, so a failure there is in
-    LMCache's KV restore rather than in the hidden-state path this PR adds.
+    The kv_only case turns the hidden-state store off, so a text failure there is
+    in LMCache's KV restore rather than in the hidden-state path this PR adds.
+    Audio is then required to be *absent*: the hit skips the prefill that would
+    have produced the hidden states, and with no store to restore them from the
+    talker has nothing to condition on.
     """
     pytest.importorskip("lmcache", reason="lmcache not installed")
 
@@ -87,5 +90,5 @@ def test_kv_offload_matches_baseline(prefix_caching, hidden_states):
         "baseline produced no audio; the HS restore path is untested without it"
     )
 
-    problems = helpers.compare(baseline, cached)
+    problems = helpers.compare(baseline, cached, expect_audio=hidden_states)
     assert not problems, "offload run diverged from the no-offload baseline:\n" + "\n".join(problems)

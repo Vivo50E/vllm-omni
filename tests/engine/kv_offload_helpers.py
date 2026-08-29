@@ -167,12 +167,21 @@ def restore_marker():
                 os.environ["OMNI_HS_RESTORE_MARKER_PATH"] = previous
 
 
-def compare(baseline: dict[str, dict], cached: dict[str, dict]) -> list[str]:
+def compare(
+    baseline: dict[str, dict], cached: dict[str, dict], *, expect_audio: bool = True
+) -> list[str]:
     """Return a problem per prompt; the waveform delta is printed, not asserted.
 
     The talker decodes autoregressively, so any float-level difference flips a
     code and the waveform diverges -- enabling the in-GPU prefix cache alone
     already moves it.
+
+    ``expect_audio=False`` inverts the audio check for the KV-only configuration:
+    a cache hit skips the thinker's prefill, so with the hidden-state store off
+    the talker is handed nothing and silence is the correct outcome. Asserting it
+    rather than tolerating it is what makes that arm evidence for the
+    hidden-state offload being load-bearing. It holds only when every request is
+    served from the cache, which is the case when the same prompts are repeated.
     """
     problems = []
     for i, prompt in enumerate(sorted(baseline)):
@@ -181,6 +190,12 @@ def compare(baseline: dict[str, dict], cached: dict[str, dict]) -> list[str]:
             problems.append(f"prompt {i}: text differs\n  baseline={want['text']!r}\n  cached={got['text']!r}")
 
         want_len, got_len = audio_len(want), audio_len(got)
+        if not expect_audio:
+            if got_len:
+                problems.append(
+                    f"prompt {i}: expected no audio without the hidden-state store, got {got_len} samples"
+                )
+            continue
         if want_len and not got_len:
             problems.append(f"prompt {i}: baseline produced {want_len} audio samples, offload produced none")
         elif want_len != got_len:
