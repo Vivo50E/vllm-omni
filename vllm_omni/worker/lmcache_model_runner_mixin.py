@@ -261,13 +261,9 @@ class LMCacheHiddenStateMixin:
                     num_computed,
                     num_external,
                 )
-                # Writing nothing is only half the protection: the merged path
-                # still reads this request's slots. That is safe when every
-                # computed token came from the engine's own prefix cache, since
-                # those rows were written here -- but blocks the connector filled
-                # were never computed by this engine, so their slots hold another
-                # request's leftovers. Drop the request from the hit set in that
-                # case so the merge falls through instead.
+                # Writing nothing is not enough: the merge still reads this
+                # request's slots, which hold leftovers for blocks the connector
+                # filled rather than this engine.
                 if num_external > 0 and self.omni_prefix_cache is not None:
                     self.omni_prefix_cache.drop_prefix_cached_new_req_id(req_id)
                 continue
@@ -283,10 +279,8 @@ class LMCacheHiddenStateMixin:
             self._maybe_write_hs_restore_marker(req_id, num_computed, layers)
             # mm layers use the flattened payload key; "hidden" stays as-is.
             remapped = {(lk if lk == "hidden" else f"hidden_states.layer_{lk}"): hs for lk, hs in layers.items()}
-            # Exactly one consumer, or the prefix gets prepended twice: with the
-            # prefix cache on, the restored rows go into the request's own slots
-            # and `_get_merged_tensors` picks them up from there, so the pooler
-            # payload must not prepend them again on top of the merged tensor.
+            # Exactly one consumer: the merge already picks up the slots we
+            # write, so stashing for the pooler payload too prepends twice.
             if self.omni_prefix_cache is not None:
                 for cache_key, hs in remapped.items():
                     self.omni_prefix_cache.write_restored_hidden_states(req_idx, self.input_batch, cache_key, hs)

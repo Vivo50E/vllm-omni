@@ -23,10 +23,7 @@ class OmniNewRequestData(NewRequestData):
         model_intermediate_buffer: Optional runner-owned payload for
             GPUModelRunner.model_intermediate_buffer
         num_external_computed_tokens: How many of ``num_computed_tokens`` a KV
-            connector supplied rather than the engine's own prefix cache. The
-            runner needs the split: blocks the connector filled were never
-            computed here, so the hidden states behind their slots are stale,
-            while blocks from a local prefix-cache hit carry valid ones.
+            connector supplied rather than the engine's own prefix cache.
     """
 
     external_req_id: str | None = None
