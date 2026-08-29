@@ -160,9 +160,10 @@ class LMCacheHiddenStateMixin:
                 continue
 
             all_stored = True
+            expected_chunks = chunk_rows // chunk_size
             for layer_key, full_buf in full_bufs.items():
                 try:
-                    hs_store.store_hidden_states(
+                    stored = hs_store.store_hidden_states(
                         seg_token_ids,
                         full_buf[:chunk_rows],
                         layer_idx=_hs_layer_idx(layer_key),
@@ -170,6 +171,19 @@ class LMCacheHiddenStateMixin:
                     )
                 except Exception:
                     logger.exception("LMCache: store_hidden_states failed (req_id=%s layer=%s)", req_id, layer_key)
+                    all_stored = False
+                    continue
+                # A full HS pool stops the store early and returns normally, so
+                # the count is the only signal that a chunk did not persist.
+                if int(stored) != expected_chunks:
+                    logger.error(
+                        "LMCache: stored %d of %d HS chunks (req_id=%s layer=%s); the HS pool "
+                        "is likely full. Not advancing the boundary so the chunk is retried.",
+                        int(stored),
+                        expected_chunks,
+                        req_id,
+                        layer_key,
+                    )
                     all_stored = False
             # Only trim buffers and advance the boundary once every layer's chunk
             # is persisted, so a failure retries the same boundary next step.
