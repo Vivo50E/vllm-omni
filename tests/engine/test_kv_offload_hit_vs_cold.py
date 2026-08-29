@@ -16,6 +16,13 @@ from tests.engine import kv_offload_helpers as helpers
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
 
+# Batch composition shifts the bf16 accumulation order, which flips greedy
+# decoding on a near-tie -- enough that a multi-request comparison fails with no
+# cache involved at all. vLLM's batch-invariant kernels remove that, so the
+# comparison below tests the restore rather than the scheduler. Set before any
+# engine process is spawned, since each reads it at import.
+os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+
 MODEL = "Qwen/Qwen2.5-Omni-3B"
 
 # Every stage shares one card; which card is overridable so two variants of
@@ -58,10 +65,9 @@ def test_second_round_matches_first(mode):
             downstream_extra=_DOWNSTREAM,
         ),
         rounds=2,
-        # One request by default: a batch of several flips greedy decoding on
-        # its own, so the control fails and the comparison says nothing about
-        # the restore. Raise it to probe multi-request behaviour.
-        num_prompts=int(os.environ.get("OMNI_TEST_NUM_PROMPTS", "1")),
+        # Several requests, so a restore that targets the wrong request's slots
+        # shows up here and not only in the unit tests.
+        num_prompts=int(os.environ.get("OMNI_TEST_NUM_PROMPTS", "3")),
     )
     cold, served = rounds[0], rounds[1]
 
