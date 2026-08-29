@@ -743,6 +743,24 @@ class OmniTensorPrefixCache:
                 block_ids = self._get_cached_block_ids(req_idx, input_batch)
                 cached_hs = cache[block_ids].reshape(-1, cache.shape[-1])
 
+                # Only whole blocks are cached, so a num_computed that is not
+                # block-aligned leaves a tail with no rows behind it. vLLM's own
+                # prefix cache only ever reports block multiples; an external
+                # connector need not, and prepending the short tensor would shift
+                # every downstream position by the difference. Say so rather than
+                # hand the talker a silent misalignment.
+                num_computed = int(input_batch.num_computed_tokens_cpu[req_idx])
+                if int(cached_hs.shape[0]) != num_computed:
+                    logger.error(
+                        "Omni prefix cache holds %d rows for req %s but %d tokens are marked "
+                        "computed; the %d-token tail is not block-aligned and has no cached "
+                        "hidden states behind it.",
+                        int(cached_hs.shape[0]),
+                        req_id,
+                        num_computed,
+                        num_computed - int(cached_hs.shape[0]),
+                    )
+
                 # Slice the hidden states corresponding to this request;
                 # we do this by using the query start
                 start = query_start_loc[req_idx]
