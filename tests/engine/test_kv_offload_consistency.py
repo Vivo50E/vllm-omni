@@ -8,11 +8,20 @@ Runs the same prompts with and without LMCache and requires identical text and
 an audio waveform wherever the baseline produced one.
 """
 
+import os
+
 import pytest
 
 from tests.engine import kv_offload_helpers as helpers
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
+
+# Batch composition shifts the bf16 accumulation order, which flips greedy
+# decoding on a near-tie -- enough that this comparison fails with no cache
+# involved at all. vLLM's batch-invariant kernels remove that, so what is left
+# is the restore. Set before any engine process is spawned, since each reads it
+# at import.
+os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
 
 MODEL = "Qwen/Qwen2.5-Omni-3B"
 
