@@ -925,6 +925,11 @@ class GPUARModelRunner(
             seg_sum = [0.0, 0.0]
             seg_nonzero = [0, 0]
             seg_elems = [0, 0]
+            # Axis 1 of the selected rows is the K/V axis, so a restore that
+            # brings back only one of the two planes shows up as one of these
+            # staying empty.
+            plane_nonzero = [0, 0]
+            plane_elems = [0, 0]
             for layer_idx, kv in enumerate(self.kv_caches):
                 if not isinstance(kv, torch.Tensor) or kv.dim() < 3:
                     continue
@@ -947,11 +952,23 @@ class GPUARModelRunner(
                     seg_sum[seg] += float(part.sum().item())
                     seg_nonzero[seg] += int((part != 0).sum().item())
                     seg_elems[seg] += int(part.numel())
+                if rows.dim() >= 2 and rows.shape[1] == 2:
+                    for plane in (0, 1):
+                        part = rows[:split, plane]
+                        plane_nonzero[plane] += int((part != 0).sum().item())
+                        plane_elems[plane] += int(part.numel())
             head = ", ".join(f"L{i}:sum={s:.4f},max={m:.4f}" for i, s, m in per_layer[:3])
             total = sum(s for _, s, _ in per_layer)
             segments = " ".join(
                 f"[{lo},{hi}):sum={seg_sum[i]:.4f},nonzero={seg_nonzero[i]}/{seg_elems[i]}"
                 for i, (lo, hi) in enumerate(((0, split), (split, span)))
+            )
+            segments += " planes[0,%d)=K:%d/%d,V:%d/%d" % (
+                split,
+                plane_nonzero[0],
+                plane_elems[0],
+                plane_nonzero[1],
+                plane_elems[1],
             )
             logger.info(
                 "[kvfp] %s req=%s covered=%d blocks[:4]=%s slots[:4]=%s layers=%d/%d "
