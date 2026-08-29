@@ -8,6 +8,8 @@ Round 1's answer is the reference -- it is what this very engine produces with
 no cache involved.
 """
 
+import os
+
 import pytest
 
 from tests.engine import kv_offload_helpers as helpers
@@ -53,7 +55,10 @@ def test_second_round_matches_first(mode):
             downstream_extra=_DOWNSTREAM,
         ),
         rounds=2,
-        num_prompts=1,
+        # One request by default: a batch of several flips greedy decoding on
+        # its own, so the control fails and the comparison says nothing about
+        # the restore. Raise it to probe multi-request behaviour.
+        num_prompts=int(os.environ.get("OMNI_TEST_NUM_PROMPTS", "1")),
     )
     cold, served = rounds[0], rounds[1]
 
