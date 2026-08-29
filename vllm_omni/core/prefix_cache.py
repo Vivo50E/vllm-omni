@@ -300,6 +300,19 @@ class OmniTensorPrefixCache:
         """Adds a new request ID to the set of prefix cache hits on the batch."""
         self._new_req_cache_hit_ids.add(req_id)
 
+    def drop_prefix_cached_new_req_id(self, req_id: str) -> None:
+        """Stop treating a request as a prefix hit for this step.
+
+        The merged path reads whatever sits in the request's slots. That is
+        right for a local prefix-cache hit -- those rows were computed here --
+        but wrong for blocks a KV connector filled and whose hidden states never
+        arrived: the slots then hold another request's leftovers. Dropping the
+        request makes the merge fall through to the newly computed rows only,
+        which the talker will visibly reject rather than silently mis-condition
+        on.
+        """
+        self._new_req_cache_hit_ids.discard(req_id)
+
     def reset_prefix_cached_new_req_ids(self):
         """Clears the cache hit IDs to prepare for a new engine step."""
         self._new_req_cache_hit_ids.clear()

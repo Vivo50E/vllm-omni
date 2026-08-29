@@ -252,12 +252,24 @@ class LMCacheHiddenStateMixin:
             if incomplete:
                 # KV is already restored but HS is not fully available; prepending
                 # would give the talker truncated conditioning. Fail loud, write nothing.
+                num_external = int(getattr(new_req, "num_external_computed_tokens", 0) or 0)
                 logger.error(
-                    "LMCache: incomplete HS restore for req_id=%s (num_computed=%d); skipping "
-                    "prepend. Size the HS pool >= KV pool or disable HS offload.",
+                    "LMCache: incomplete HS restore for req_id=%s (num_computed=%d, "
+                    "%d of them from the connector); skipping prepend. Size the HS pool "
+                    ">= KV pool or disable HS offload.",
                     req_id,
                     num_computed,
+                    num_external,
                 )
+                # Writing nothing is only half the protection: the merged path
+                # still reads this request's slots. That is safe when every
+                # computed token came from the engine's own prefix cache, since
+                # those rows were written here -- but blocks the connector filled
+                # were never computed by this engine, so their slots hold another
+                # request's leftovers. Drop the request from the hit set in that
+                # case so the merge falls through instead.
+                if num_external > 0 and self.omni_prefix_cache is not None:
+                    self.omni_prefix_cache.drop_prefix_cached_new_req_id(req_id)
                 continue
             if not layers:
                 continue
