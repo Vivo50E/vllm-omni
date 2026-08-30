@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -915,3 +916,41 @@ def test_get_merged_multimodal_outputs_broadcasts_non_token_aligned_passthrough(
     out["req1"] += 100
     assert torch.equal(out["req2"], expected)
     assert torch.equal(passthrough, expected)
+
+
+def test_merged_tensors_flag_a_block_unaligned_hit(caplog):
+    """Only whole blocks are cached, so an unaligned num_computed loses its tail."""
+    block_size = 16
+    hidden_size = 4
+    cache = OmniTensorPrefixCache(
+        num_blocks=8, block_size=block_size, hidden_size=hidden_size, hs_dtype=torch.float32
+    )
+    cache.add_prefix_cached_new_req_id("r1")
+
+    num_computed = 33  # 2 whole blocks plus one token with no row behind it
+    block_table = torch.zeros((1, 8), dtype=torch.int32)
+    block_table[0, :3] = torch.tensor([1, 2, 3], dtype=torch.int32)
+    # The cache indexes block_table[0] and also reads .block_tables for the
+    # multi-group warning, so it needs both.
+    class _BlockTables(list):
+        block_tables = [None]
+
+    input_batch = SimpleNamespace(
+        req_ids=["r1"],
+        req_id_to_index={"r1": 0},
+        num_computed_tokens_cpu=torch.tensor([num_computed]),
+        block_table=_BlockTables([SimpleNamespace(block_table=SimpleNamespace(cpu=block_table))]),
+    )
+
+    with caplog.at_level("ERROR"):
+        merged = cache._get_merged_tensors(
+            query_start_loc=torch.tensor([0]),
+            input_batch=input_batch,
+            cache=cache.hidden_states_cache,
+            hidden_states=torch.ones(4, hidden_size),
+            num_scheduled_tokens={"r1": 4},
+        )
+
+    assert "not block-aligned" in caplog.text
+    # 2 whole blocks (32 rows) + 4 scheduled, one row short of num_computed + 4.
+    assert merged["r1"].shape[0] == 2 * block_size + 4

@@ -173,7 +173,7 @@ class LMCacheHiddenStateMixin:
                     continue
                 # A full HS pool stops the store early and returns normally, so
                 # the count is the only signal that a chunk did not persist.
-                if int(stored) != expected_chunks:
+                if stored is not None and int(stored) != expected_chunks:
                     logger.error(
                         "LMCache: stored %d of %d HS chunks (req_id=%s layer=%s); the HS pool "
                         "is likely full. Not advancing the boundary so the chunk is retried.",

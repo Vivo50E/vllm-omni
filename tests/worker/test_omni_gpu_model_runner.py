@@ -1202,3 +1202,91 @@ def test_hs_lmcache_store_slices_per_request_in_multi_request_batch():
     assert torch.equal(hs_store.calls[0].hidden_states[:, 0], torch.tensor([0.0, 1.0, 2.0, 3.0]))
     assert torch.equal(hs_store.calls[1].hidden_states[:, 0], torch.tensor([4.0, 5.0, 6.0, 7.0]))
     assert len(by_offset) == 2
+
+
+# ---------------------------------------------------------------------------
+# LMCache HS restore: one consumer, and a short store is a failure
+# ---------------------------------------------------------------------------
+
+
+class _StubHSStore:
+    """Returns a fixed-length prefix for every layer."""
+
+    def __init__(self, rows: int, hidden_size: int = 2):
+        self.rows = rows
+        self.hidden_size = hidden_size
+
+    def retrieve_hidden_states(self, token_ids, *, layer_idx=0):
+        if self.rows <= 0:
+            return None
+        return torch.ones(self.rows, self.hidden_size)
+
+
+class _StubPrefixCache:
+    def __init__(self):
+        self.writes = []
+
+    def write_restored_hidden_states(self, req_idx, input_batch, layer_key, hs):
+        self.writes.append((req_idx, layer_key, hs.shape[0]))
+
+
+def _make_restore_runner(*, stored_rows, prefix_cache, num_computed=8, prompt_tokens=16):
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = ()
+    engine = SimpleNamespace(
+        hidden_state_store=_StubHSStore(stored_rows),
+        config=SimpleNamespace(chunk_size=4),
+    )
+    runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
+    runner.omni_prefix_cache = prefix_cache
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={"r1": 0},
+        num_prompt_tokens=[prompt_tokens],
+        token_ids_cpu=torch.arange(64).reshape(1, 64),
+    )
+    sched_out = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)]
+    )
+    return runner, sched_out
+
+
+def test_hs_restore_writes_slots_instead_of_stashing_when_prefix_cache_is_on():
+    """Both consumers firing would prepend the same prefix twice."""
+    cache = _StubPrefixCache()
+    runner, sched_out = _make_restore_runner(stored_rows=8, prefix_cache=cache)
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert cache.writes == [(0, "hidden", 8)]
+    assert runner._restored_mm == {}
+
+
+def test_hs_restore_stashes_for_the_pooler_without_a_prefix_cache():
+    runner, sched_out = _make_restore_runner(stored_rows=8, prefix_cache=None)
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert set(runner._restored_mm) == {"r1"}
+    assert runner._restored_mm["r1"]["hidden"].shape[0] == 8
+
+
+def test_hs_restore_skips_everything_when_the_store_is_short():
+    cache = _StubPrefixCache()
+    runner, sched_out = _make_restore_runner(stored_rows=5, prefix_cache=cache)
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert cache.writes == []
+    assert runner._restored_mm == {}
+
+
+def test_hs_store_short_write_does_not_advance_the_boundary():
+    """A full pool stops the store early and returns normally, not by raising."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+    hs_store.store_hidden_states = lambda *a, **k: 0
+
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+
+    assert runner._hs_saved_boundary.get("r1", 0) == 0
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 8
