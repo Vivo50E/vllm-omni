@@ -227,6 +227,12 @@ class LMCacheHiddenStateMixin:
         for new_req in scheduler_output.scheduled_new_reqs:
             if new_req.num_computed_tokens <= 0:
                 continue
+            # A hit served entirely by the engine's own prefix cache already has
+            # its hidden states in those slots. Asking LMCache for them finds a
+            # shorter chunk-aligned prefix and reports a fallback that is not one.
+            # None means the split is unknown, so keep asking.
+            if getattr(new_req, "num_external_computed_tokens", None) == 0:
+                continue
             req_id = new_req.req_id
             req_idx = self.input_batch.req_id_to_index.get(req_id)
             if req_idx is None:
