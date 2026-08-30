@@ -7,8 +7,6 @@ keeps thin no-op hooks (``_setup_lmcache_hidden_state_offload`` and
 ``_drop_hs_pending_state``) so non-AR runners carry none of this.
 """
 
-import os
-
 import torch
 from vllm.logger import init_logger
 
@@ -160,9 +158,10 @@ class LMCacheHiddenStateMixin:
                 continue
 
             all_stored = True
+            expected_chunks = chunk_rows // chunk_size
             for layer_key, full_buf in full_bufs.items():
                 try:
-                    hs_store.store_hidden_states(
+                    stored = hs_store.store_hidden_states(
                         seg_token_ids,
                         full_buf[:chunk_rows],
                         layer_idx=_hs_layer_idx(layer_key),
@@ -170,6 +169,19 @@ class LMCacheHiddenStateMixin:
                     )
                 except Exception:
                     logger.exception("LMCache: store_hidden_states failed (req_id=%s layer=%s)", req_id, layer_key)
+                    all_stored = False
+                    continue
+                # A full HS pool stops the store early and returns normally, so
+                # the count is the only signal that a chunk did not persist.
+                if stored is not None and int(stored) != expected_chunks:
+                    logger.error(
+                        "LMCache: stored %d of %d HS chunks (req_id=%s layer=%s); the HS pool "
+                        "is likely full. Not advancing the boundary so the chunk is retried.",
+                        int(stored),
+                        expected_chunks,
+                        req_id,
+                        layer_key,
+                    )
                     all_stored = False
             # Only trim buffers and advance the boundary once every layer's chunk
             # is persisted, so a failure retries the same boundary next step.
@@ -187,17 +199,6 @@ class LMCacheHiddenStateMixin:
         restored_mm = getattr(self, "_restored_mm", None)
         if restored_mm is not None:
             restored_mm.pop(req_id, None)
-
-    def _maybe_write_hs_restore_marker(self, req_id: str, num_computed: int, layers: dict) -> None:
-        """Test-only hook: record a restore event when OMNI_HS_RESTORE_MARKER_PATH is set."""
-        marker_path = os.environ.get("OMNI_HS_RESTORE_MARKER_PATH")
-        if not marker_path:
-            return
-        try:
-            with open(marker_path, "a", encoding="utf-8") as fp:
-                fp.write(f"{req_id}\t{num_computed}\t{','.join(sorted(layers.keys()))}\n")
-        except OSError:
-            pass
 
     def _maybe_restore_hs_from_lmcache(self, scheduler_output=None):
         """Restore per-layer hidden states from LMCache for KV-hit new requests.
@@ -268,10 +269,12 @@ class LMCacheHiddenStateMixin:
                 num_computed,
                 list(layers.keys()),
             )
-            self._maybe_write_hs_restore_marker(req_id, num_computed, layers)
             # mm layers use the flattened payload key; "hidden" stays as-is.
             remapped = {(lk if lk == "hidden" else f"hidden_states.layer_{lk}"): hs for lk, hs in layers.items()}
-            self._restored_mm[req_id] = remapped
+            # Exactly one consumer: the merge already picks up the slots we
+            # write, so stashing for the pooler payload too prepends twice.
             if self.omni_prefix_cache is not None:
                 for cache_key, hs in remapped.items():
                     self.omni_prefix_cache.write_restored_hidden_states(req_idx, self.input_batch, cache_key, hs)
+            else:
+                self._restored_mm[req_id] = remapped
