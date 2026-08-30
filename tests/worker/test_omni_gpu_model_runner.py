@@ -1230,7 +1230,7 @@ class _StubPrefixCache:
         self.writes.append((req_idx, layer_key, hs.shape[0]))
 
 
-def _make_restore_runner(*, stored_rows, prefix_cache, num_computed=8, prompt_tokens=16):
+def _make_dual_consumer_runner(*, stored_rows, prefix_cache, num_computed=8, prompt_tokens=16):
     runner = object.__new__(LMCacheHiddenStateMixin)
     runner._has_lmcache = True
     runner._lmcache_hs_mm_keys = ()
@@ -1254,7 +1254,7 @@ def _make_restore_runner(*, stored_rows, prefix_cache, num_computed=8, prompt_to
 def test_hs_restore_writes_slots_instead_of_stashing_when_prefix_cache_is_on():
     """Both consumers firing would prepend the same prefix twice."""
     cache = _StubPrefixCache()
-    runner, sched_out = _make_restore_runner(stored_rows=8, prefix_cache=cache)
+    runner, sched_out = _make_dual_consumer_runner(stored_rows=8, prefix_cache=cache)
 
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
 
@@ -1263,7 +1263,7 @@ def test_hs_restore_writes_slots_instead_of_stashing_when_prefix_cache_is_on():
 
 
 def test_hs_restore_stashes_for_the_pooler_without_a_prefix_cache():
-    runner, sched_out = _make_restore_runner(stored_rows=8, prefix_cache=None)
+    runner, sched_out = _make_dual_consumer_runner(stored_rows=8, prefix_cache=None)
 
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
 
@@ -1273,7 +1273,7 @@ def test_hs_restore_stashes_for_the_pooler_without_a_prefix_cache():
 
 def test_hs_restore_skips_everything_when_the_store_is_short():
     cache = _StubPrefixCache()
-    runner, sched_out = _make_restore_runner(stored_rows=5, prefix_cache=cache)
+    runner, sched_out = _make_dual_consumer_runner(stored_rows=5, prefix_cache=cache)
 
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
 
