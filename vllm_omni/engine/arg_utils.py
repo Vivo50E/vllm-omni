@@ -147,11 +147,37 @@ def _build_lmcache_connector_config(lmcache_config: dict) -> dict:
     # Omni stages need hidden states alongside KV; enable by default so the
     # HiddenStateStore is created. User can override via lmcache_config.
     lmcache_extra.setdefault("lmcache.enable_hidden_state_cache", True)
+    _warn_if_hidden_state_pool_undersized(lmcache_extra)
     return {
         "kv_connector": "LMCacheConnectorV1",
         "kv_role": "kv_both",
         "kv_connector_extra_config": lmcache_extra,
     }
+
+
+def _warn_if_hidden_state_pool_undersized(lmcache_extra: dict) -> None:
+    """Warn when hidden states will be evicted before the KV they belong to.
+
+    The two pools evict independently, so a smaller hidden-state pool drops rows
+    whose KV is still resident. The engine then skips a prefill it cannot supply
+    conditioning for, and the request silently degrades.
+    """
+    hs_size = lmcache_extra.get("lmcache.max_hidden_state_cpu_size")
+    kv_size = lmcache_extra.get("lmcache.max_local_cpu_size")
+    if hs_size is None or kv_size is None:
+        return
+    try:
+        if float(hs_size) >= float(kv_size):
+            return
+    except (TypeError, ValueError):
+        return
+    logger.warning(
+        "max_hidden_state_cpu_size (%s GB) is smaller than max_local_cpu_size "
+        "(%s GB): hidden states will be evicted while their KV survives, and "
+        "those requests fall back to a partial restore.",
+        hs_size,
+        kv_size,
+    )
 
 
 def _set_lmcache_env(args: "OmniEngineArgs") -> None:
