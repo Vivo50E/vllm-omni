@@ -300,10 +300,6 @@ class OmniTensorPrefixCache:
         """Adds a new request ID to the set of prefix cache hits on the batch."""
         self._new_req_cache_hit_ids.add(req_id)
 
-    def drop_prefix_cached_new_req_id(self, req_id: str) -> None:
-        """Stop treating a request as a prefix hit, so the merge skips its slots."""
-        self._new_req_cache_hit_ids.discard(req_id)
-
     def reset_prefix_cached_new_req_ids(self):
         """Clears the cache hit IDs to prepare for a new engine step."""
         self._new_req_cache_hit_ids.clear()

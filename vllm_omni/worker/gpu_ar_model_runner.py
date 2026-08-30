@@ -7,7 +7,6 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
-import os
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext

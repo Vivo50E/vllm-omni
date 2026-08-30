@@ -22,14 +22,11 @@ class OmniNewRequestData(NewRequestData):
             dictionary containing tensors or lists
         model_intermediate_buffer: Optional runner-owned payload for
             GPUModelRunner.model_intermediate_buffer
-        num_external_computed_tokens: How many of ``num_computed_tokens`` a KV
-            connector supplied rather than the engine's own prefix cache.
     """
 
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | None = None
     model_intermediate_buffer: dict[str, object] | None = None
-    num_external_computed_tokens: int = 0
 
     @classmethod
     def from_base(
@@ -44,7 +41,6 @@ class OmniNewRequestData(NewRequestData):
             external_req_id=getattr(request, "external_req_id", None),
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
-            num_external_computed_tokens=int(getattr(request, "num_external_computed_tokens", 0) or 0),
         )
 
     @classmethod
@@ -79,7 +75,6 @@ class OmniNewRequestData(NewRequestData):
             prefill_token_ids=prefill_token_ids,
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
-            num_external_computed_tokens=int(getattr(request, "num_external_computed_tokens", 0) or 0),
         )
 
 
