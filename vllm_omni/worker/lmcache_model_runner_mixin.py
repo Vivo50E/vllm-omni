@@ -7,8 +7,15 @@ keeps thin no-op hooks (``_setup_lmcache_hidden_state_offload`` and
 ``_drop_hs_pending_state``) so non-AR runners carry none of this.
 """
 
+from typing import TYPE_CHECKING, Any
+
 import torch
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_input_batch import InputBatch
+
+    from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 
 logger = init_logger(__name__)
 
@@ -25,6 +32,11 @@ def _hs_layer_idx(layer_key: str) -> int:
 
 class LMCacheHiddenStateMixin:
     """Store/restore per-layer hidden states in LMCache alongside KV."""
+
+    # Supplied by the runner this is mixed into.
+    input_batch: "InputBatch"
+    query_start_loc: Any
+    omni_prefix_cache: "OmniTensorPrefixCache | None"
 
     def _setup_lmcache_hidden_state_offload(self) -> None:
         """Init HS-offload state and discover the mm taps from the talker config."""
