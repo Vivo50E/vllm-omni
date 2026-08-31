@@ -42,6 +42,7 @@ class LMCacheHiddenStateMixin:
         """Init HS-offload state and discover the mm taps from the talker config."""
         self._hs_pending_buffer: dict[str, dict[str, list[torch.Tensor]]] = {}
         self._hs_saved_boundary: dict[str, int] = {}
+        self._hs_mm_features: dict[str, tuple[list, list]] = {}
         self._lmcache_hs_mm_keys: tuple[str, ...] = ()
         omni_kv = getattr(getattr(self, "model_config", None), "omni_kv_config", None)
         kv_store = omni_kv.get("kv_store_config") if isinstance(omni_kv, dict) else None
@@ -55,6 +56,33 @@ class LMCacheHiddenStateMixin:
         if accept_layer is not None:
             self._lmcache_hs_mm_keys = ("0", str(int(accept_layer)))
         logger.info("LMCache hidden state store/restore enabled (mm_keys=%s)", self._lmcache_hs_mm_keys)
+
+    def _record_mm_features(self, scheduler_output) -> None:
+        """Remember each new request's multimodal spans for key derivation."""
+        new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None) or ()
+        if not new_reqs:
+            return
+        from lmcache.integration.vllm.utils import extract_mm_features
+
+        for new_req in new_reqs:
+            self._hs_mm_features[new_req.req_id] = extract_mm_features(new_req)
+
+    def _keyed_token_ids(self, req_idx: int, req_id: str, end: int) -> list[int]:
+        """Token ids as LMCache keys them, with multimodal spans hashed.
+
+        The hidden-state store shares the KV chunk keys, and LMCache rewrites
+        placeholder spans with feature hashes before storing KV. Keying hidden
+        states off the raw ids would file them under keys whose KV never exists.
+        """
+        ids = self.input_batch.token_ids_cpu[req_idx, :end]
+        mm_hashes, mm_positions = self._hs_mm_features.get(req_id, ([], []))
+        if not mm_hashes:
+            return ids.tolist()
+        from lmcache.integration.vllm.utils import apply_mm_hashes_to_token_ids
+
+        keyed = torch.as_tensor(ids).clone()
+        apply_mm_hashes_to_token_ids(keyed, mm_hashes, mm_positions)
+        return keyed.tolist()
 
     def _get_lmcache_adapter(self):
         """Lazily find the LMCacheConnectorV1Impl adapter from the KV connector."""
@@ -108,6 +136,7 @@ class LMCacheHiddenStateMixin:
         hs_store = engine.hidden_state_store
         if hs_store is None:
             return
+        self._record_mm_features(scheduler_output)
 
         chunk_size = int(getattr(engine.config, "chunk_size", None) or 256)
 
@@ -170,7 +199,7 @@ class LMCacheHiddenStateMixin:
                 continue
 
             chunk_rows = new_boundary - saved_boundary
-            seg_token_ids = self.input_batch.token_ids_cpu[req_idx, :new_boundary].tolist()
+            seg_token_ids = self._keyed_token_ids(req_idx, req_id, new_boundary)
             full_bufs = {k: (torch.cat(b, dim=0) if len(b) > 1 else b[0]) for k, b in req_buf.items()}
             if any(int(fb.shape[0]) < chunk_rows for fb in full_bufs.values()):
                 continue
@@ -214,6 +243,7 @@ class LMCacheHiddenStateMixin:
         """Discard buffered HS / saved-boundary / restored state for ``req_id``."""
         self._hs_pending_buffer.pop(req_id, None)
         self._hs_saved_boundary.pop(req_id, None)
+        self._hs_mm_features.pop(req_id, None)
         restored_mm = getattr(self, "_restored_mm", None)
         if restored_mm is not None:
             restored_mm.pop(req_id, None)
@@ -236,6 +266,7 @@ class LMCacheHiddenStateMixin:
         hs_store = engine.hidden_state_store
         if hs_store is None:
             return
+        self._record_mm_features(scheduler_output)
 
         # Per-request restored HS, consumed (popped) by _build_omni_pooler_payload.
         # Not wiped wholesale each step: with async omni output the pooler build is
@@ -257,7 +288,7 @@ class LMCacheHiddenStateMixin:
             retrieve_len = min(prompt_tokens, aligned_up)
             if retrieve_len <= 0:
                 continue
-            lookup_ids = self.input_batch.token_ids_cpu[req_idx, :retrieve_len].tolist()
+            lookup_ids = self._keyed_token_ids(req_idx, req_id, retrieve_len)
 
             layers: dict[str, torch.Tensor] = {}
             incomplete = False
