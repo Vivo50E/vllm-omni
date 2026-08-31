@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Utilities for Prefix Caching in Omni models.
 """
@@ -759,4 +762,3 @@ class OmniTensorPrefixCache:
                 combined_hidden_states[req_id] = new_hs
 
         return combined_hidden_states
-

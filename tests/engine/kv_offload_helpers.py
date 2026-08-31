@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared pieces for the LMCache KV + hidden-state offload consistency tests.
 
 Kept model-agnostic so each model gets its own test module with its own device
@@ -145,9 +145,7 @@ def audio_len(entry: dict) -> int:
     return 0 if audio is None else int(audio.numel())
 
 
-def compare(
-    baseline: dict[str, dict], cached: dict[str, dict], *, expect_audio: bool = True
-) -> list[str]:
+def compare(baseline: dict[str, dict], cached: dict[str, dict], *, expect_audio: bool = True) -> list[str]:
     """Return a problem per prompt; the waveform delta is printed, not asserted.
 
     The talker decodes autoregressively, so any float-level difference flips a
@@ -170,9 +168,7 @@ def compare(
         want_len, got_len = audio_len(want), audio_len(got)
         if not expect_audio:
             if got_len:
-                problems.append(
-                    f"prompt {i}: expected no audio without the hidden-state store, got {got_len} samples"
-                )
+                problems.append(f"prompt {i}: expected no audio without the hidden-state store, got {got_len} samples")
             continue
         if want_len and not got_len:
             problems.append(f"prompt {i}: baseline produced {want_len} audio samples, offload produced none")

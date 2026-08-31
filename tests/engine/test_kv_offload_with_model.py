@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Smoke test for the YAML config surface, not for accuracy.
 
 Asserts only that a deploy config carrying ``omni_kv_config`` reaches
@@ -94,4 +97,6 @@ def _run(model: str, mode: str, num_prompts: int = 3) -> bool:
 @pytest.mark.parametrize("mode", list(MODES.keys()))
 def test_kv_offload_modes(mode):
     pytest.importorskip("lmcache", reason="lmcache not installed")
-    assert _run(DEFAULT_MODEL, mode), f"No text output for mode={mode}; the YAML config surface did not reach the engine"
+    assert _run(DEFAULT_MODEL, mode), (
+        f"No text output for mode={mode}; the YAML config surface did not reach the engine"
+    )

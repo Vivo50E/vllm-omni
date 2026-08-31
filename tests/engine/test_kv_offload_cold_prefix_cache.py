@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Does a KV hit that only LMCache can serve leave the talker with stale hidden states?
 
 ``_update_states`` marks a request as an in-GPU prefix-cache hit whenever

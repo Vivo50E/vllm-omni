@@ -1266,9 +1266,7 @@ def _make_dual_consumer_runner(*, stored_rows, prefix_cache, num_computed=8, pro
         num_prompt_tokens=[prompt_tokens],
         token_ids_cpu=torch.arange(64).reshape(1, 64),
     )
-    sched_out = SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)]
-    )
+    sched_out = SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)])
     return runner, sched_out
 
 

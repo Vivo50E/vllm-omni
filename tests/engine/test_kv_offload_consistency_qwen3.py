@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """E2E accuracy guard for the LMCache offload path on Qwen3-Omni.
 
 Same comparison as the Qwen2.5-Omni test, on the model that actually exercises

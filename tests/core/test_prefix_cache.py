@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import math
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -920,9 +923,7 @@ def test_merged_tensors_keep_a_block_unaligned_hit_whole():
     """An external connector can report a num_computed that is not block-aligned."""
     block_size = 16
     hidden_size = 4
-    cache = OmniTensorPrefixCache(
-        num_blocks=8, block_size=block_size, hidden_size=hidden_size, hs_dtype=torch.float32
-    )
+    cache = OmniTensorPrefixCache(num_blocks=8, block_size=block_size, hidden_size=hidden_size, hs_dtype=torch.float32)
     cache.add_prefix_cached_new_req_id("r1")
 
     num_computed = 33  # two whole blocks plus one token
