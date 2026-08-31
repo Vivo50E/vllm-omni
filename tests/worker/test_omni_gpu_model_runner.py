@@ -1159,7 +1159,7 @@ def test_pooler_payload_casts_restored_prefix_to_batch_dtype(monkeypatch):
     )
 
     runner = object.__new__(GPUARModelRunner)
-    runner._restored_mm = {
+    restored_mm = {
         "r1": {
             "hidden": torch.zeros(3, 2, dtype=torch.float32),
             "mm0": torch.zeros(3, 2, dtype=torch.float32),
@@ -1168,6 +1168,7 @@ def test_pooler_payload_casts_restored_prefix_to_batch_dtype(monkeypatch):
 
     payload = GPUARModelRunner._build_omni_pooler_payload(
         runner,
+        restored_mm=restored_mm,
         rid="r1",
         idx=0,
         start=0,
