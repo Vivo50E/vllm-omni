@@ -145,12 +145,22 @@ def audio_len(entry: dict) -> int:
     return 0 if audio is None else int(audio.numel())
 
 
-def compare(baseline: dict[str, dict], cached: dict[str, dict], *, expect_audio: bool = True) -> list[str]:
-    """Return a problem per prompt; the waveform delta is printed, not asserted.
+def compare(
+    baseline: dict[str, dict],
+    cached: dict[str, dict],
+    *,
+    expect_audio: bool = True,
+    assert_waveform: bool = True,
+) -> list[str]:
+    """Return a problem per prompt.
 
-    The talker decodes autoregressively, so any float-level difference flips a
-    code and the waveform diverges -- enabling the in-GPU prefix cache alone
-    already moves it.
+    ``assert_waveform`` requires the waveforms to match sample for sample. That
+    holds between two engines compared at the same round, which is what makes
+    the audio check meaningful rather than a length comparison. It does not hold
+    between an engine's first and second round: the first inference after
+    startup carries JIT and autotuning state that the rest do not, and the
+    talker's autoregressive decode amplifies it into a different waveform even
+    when the text is identical.
 
     ``expect_audio=False`` inverts the audio check for the KV-only configuration:
     a cache hit skips the thinker's prefill, so with the hidden-state store off
@@ -177,4 +187,6 @@ def compare(baseline: dict[str, dict], cached: dict[str, dict], *, expect_audio:
         elif want_len:
             delta = (got["audio"] - want["audio"]).abs().max().item()
             print(f"prompt {i}: audio max|delta| = {delta:.3e}")
+            if assert_waveform and delta != 0:
+                problems.append(f"prompt {i}: audio differs, max|delta| = {delta:.3e}")
     return problems
