@@ -833,6 +833,7 @@ class GPUARModelRunner(
         sparse_mm_index: dict[str, int],
         hidden_seq_len: int,
         scheduled_seq_len: int,
+        restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
         req_hidden_states = None
@@ -864,7 +865,6 @@ class GPUARModelRunner(
         # Prepend per-layer HS restored from LMCache on a KV-cache hit so the
         # talker sees the full prefix. Audio-sparse outputs skip the hidden tap
         # entirely, so the prepend is gated on the same flag.
-        restored_mm = getattr(self, "_restored_mm", None)
         if not audio_sparse_output and restored_mm and rid in restored_mm:
             for layer_key, prefix_tensor in restored_mm.pop(rid).items():
                 if layer_key == "hidden":
@@ -1857,6 +1857,7 @@ class GPUARModelRunner(
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
+        restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
@@ -1972,6 +1973,7 @@ class GPUARModelRunner(
                         sparse_mm_index=sparse_mm_index,
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
+                        restored_mm=restored_mm,
                     )
                     pooler_output.append(flatten_payload(payload))
 
@@ -2228,6 +2230,11 @@ class GPUARModelRunner(
             multimodal_outputs=multimodal_outputs,
         )
 
+        # Taken here rather than read inside the builder: the builder can run
+        # after a later step has already restored this request again, and it
+        # would then consume the wrong step's prefix.
+        restored_mm_snapshot = self._take_restored_mm(req_ids_output_snapshot)
+
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
@@ -2251,6 +2258,7 @@ class GPUARModelRunner(
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
                     postprocess_already_applied=omni_postprocess_already_applied,
+                    restored_mm=restored_mm_snapshot,
                 )
 
         if not use_async_omni_output:

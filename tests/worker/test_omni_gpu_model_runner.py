@@ -1353,3 +1353,22 @@ def test_keyed_token_ids_pass_through_without_multimodal_spans():
     runner._hs_mm_features = {}
 
     assert runner._keyed_token_ids(0, "r1", 5) == [0, 1, 2, 3, 4]
+
+
+def test_take_restored_mm_removes_only_the_requested_ids():
+    """The payload builder can run late, so it consumes a snapshot, not live state."""
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._restored_mm = {
+        "r1": {"hidden": torch.ones(2, 2)},
+        "r2": {"hidden": torch.ones(3, 2)},
+    }
+
+    taken = runner._take_restored_mm(["r1"])
+
+    assert set(taken) == {"r1"}
+    assert set(runner._restored_mm) == {"r2"}
+
+
+def test_take_restored_mm_is_empty_without_lmcache():
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    assert runner._take_restored_mm(["r1"]) == {}
