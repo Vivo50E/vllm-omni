@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """E2E accuracy guard for the LMCache KV + hidden-state offload path (Qwen2.5-Omni).
 
 A cache hit skips prefill, so the restored KV and hidden states must reproduce
