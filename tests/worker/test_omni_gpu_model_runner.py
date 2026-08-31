@@ -910,6 +910,7 @@ def _make_lmcache_runner(chunk_size=4, hidden_size=2, req_id="r1", token_capacit
     runner._lmcache_hs_mm_keys = ()
     runner._hs_pending_buffer = {}
     runner._hs_saved_boundary = {}
+    runner._hs_mm_features = {}
 
     hs_store = _FakeHSStore()
     engine = SimpleNamespace(
@@ -1050,6 +1051,7 @@ def _make_restore_runner(rows_by_layer, num_computed=8, chunk_size=4, mm_keys=()
     runner = object.__new__(LMCacheHiddenStateMixin)
     runner._has_lmcache = True
     runner._lmcache_hs_mm_keys = mm_keys
+    runner._hs_mm_features = {}
     runner.omni_prefix_cache = None
     engine = SimpleNamespace(
         hidden_state_store=_FakeRetrieveStore(rows_by_layer),
@@ -1195,6 +1197,7 @@ def test_hs_lmcache_store_slices_per_request_in_multi_request_batch():
     runner._lmcache_hs_mm_keys = ()
     runner._hs_pending_buffer = {}
     runner._hs_saved_boundary = {}
+    runner._hs_mm_features = {}
 
     hs_store = _FakeHSStore()
     engine = SimpleNamespace(hidden_state_store=hs_store, config=SimpleNamespace(chunk_size=4))
@@ -1255,6 +1258,7 @@ def _make_dual_consumer_runner(*, stored_rows, prefix_cache, num_computed=8, pro
     runner = object.__new__(LMCacheHiddenStateMixin)
     runner._has_lmcache = True
     runner._lmcache_hs_mm_keys = ()
+    runner._hs_mm_features = {}
     engine = SimpleNamespace(
         hidden_state_store=_StubHSStore(stored_rows),
         config=SimpleNamespace(chunk_size=4),
@@ -1323,3 +1327,29 @@ def test_hs_store_after_a_restore_still_flushes():
     call = hs_store.calls[0]
     assert call.token_offset == 4
     assert call.hidden_states.shape == (4, 2)
+
+
+def test_keyed_token_ids_hash_multimodal_spans():
+    """Hidden states share the KV chunk keys, which have mm spans hashed."""
+    pytest.importorskip("lmcache", reason="lmcache not installed")
+    from lmcache.integration.vllm.utils import hex_hash_to_int16
+
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner.input_batch = SimpleNamespace(token_ids_cpu=torch.arange(16).reshape(1, 16))
+    placeholder = SimpleNamespace(offset=4, length=3)
+    runner._hs_mm_features = {"r1": (["ab" * 16], [placeholder])}
+
+    keyed = runner._keyed_token_ids(0, "r1", 10)
+
+    expected = hex_hash_to_int16("ab" * 16)
+    assert keyed[4:7] == [expected] * 3
+    assert keyed[:4] == [0, 1, 2, 3]
+    assert keyed[7:] == [7, 8, 9]
+
+
+def test_keyed_token_ids_pass_through_without_multimodal_spans():
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner.input_batch = SimpleNamespace(token_ids_cpu=torch.arange(16).reshape(1, 16))
+    runner._hs_mm_features = {}
+
+    assert runner._keyed_token_ids(0, "r1", 5) == [0, 1, 2, 3, 4]
