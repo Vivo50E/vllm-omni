@@ -1015,7 +1015,7 @@ def test_hs_lmcache_store_failure_keeps_boundary_and_buffer():
 
     _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
 
-    assert "r1" not in runner._hs_saved_boundary
+    assert runner._hs_saved_boundary.get("r1", 0) == 0
     assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 8
 
 
