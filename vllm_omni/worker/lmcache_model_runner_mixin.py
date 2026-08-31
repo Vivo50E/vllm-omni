@@ -239,6 +239,13 @@ class LMCacheHiddenStateMixin:
                 req_buf[layer_key] = [remainder] if remainder.shape[0] > 0 else []
             self._hs_saved_boundary[req_id] = new_boundary
 
+    def _take_restored_mm(self, req_ids) -> dict[str, dict[str, torch.Tensor]]:
+        """Remove and return the restored prefixes for ``req_ids``."""
+        restored = getattr(self, "_restored_mm", None)
+        if not restored:
+            return {}
+        return {rid: restored.pop(rid) for rid in req_ids if rid in restored}
+
     def _drop_hs_pending_state(self, req_id: str) -> None:
         """Discard buffered HS / saved-boundary / restored state for ``req_id``."""
         self._hs_pending_buffer.pop(req_id, None)
