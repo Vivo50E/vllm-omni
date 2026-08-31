@@ -1309,3 +1309,17 @@ def test_hs_store_short_write_does_not_advance_the_boundary():
 
     assert runner._hs_saved_boundary.get("r1", 0) == 0
     assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 8
+
+
+def test_hs_store_after_a_restore_still_flushes():
+    """A restored prefix was never buffered, so the boundary must start past it."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # Request arrives with 4 tokens already restored and 4 scheduled.
+    _drive_step(runner, sched=4, num_computed=4, hs_rows=4)
+
+    assert runner._hs_saved_boundary["r1"] == 8
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 4
+    assert call.hidden_states.shape == (4, 2)
