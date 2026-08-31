@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Minimal repro: does serving a prompt from LMCache change its own answer?
 
 Every earlier comparison ran two engines and differed in more than one way. Here
