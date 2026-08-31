@@ -158,7 +158,13 @@ class LMCacheHiddenStateMixin:
             for layer_key in layers_to_store:
                 req_buf.setdefault(layer_key, []).append(hs_cpu_by_layer[layer_key][start : start + sched])
 
-            saved_boundary = self._hs_saved_boundary.get(req_id, 0)
+            # A restored prefix was never buffered here, so accounting has to
+            # start where it ended; leaving the boundary at 0 makes chunk_rows
+            # exceed what the buffer can ever hold and nothing flushes again.
+            if req_id not in self._hs_saved_boundary:
+                self._hs_saved_boundary[req_id] = (num_computed // chunk_size) * chunk_size
+
+            saved_boundary = self._hs_saved_boundary[req_id]
             new_boundary = (total // chunk_size) * chunk_size
             if new_boundary <= saved_boundary:
                 continue
