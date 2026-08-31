@@ -740,22 +740,12 @@ class OmniTensorPrefixCache:
             req_idx = input_batch.req_id_to_index[req_id]
 
             if req_id in self._new_req_cache_hit_ids:
-                block_ids = self._get_cached_block_ids(req_idx, input_batch)
-                cached_hs = cache[block_ids].reshape(-1, cache.shape[-1])
-
-                # Only whole blocks are cached, so a num_computed that is not
-                # block-aligned would shift every downstream position.
+                # Resolved per token, not per block: the write side scatters by
+                # slot, and an external connector can report a num_computed that
+                # is not block-aligned, whose tail would otherwise be dropped.
                 num_computed = int(input_batch.num_computed_tokens_cpu[req_idx])
-                if int(cached_hs.shape[0]) != num_computed:
-                    logger.error(
-                        "Omni prefix cache holds %d rows for req %s but %d tokens are marked "
-                        "computed; the %d-token tail is not block-aligned and has no cached "
-                        "hidden states behind it.",
-                        int(cached_hs.shape[0]),
-                        req_id,
-                        num_computed,
-                        num_computed - int(cached_hs.shape[0]),
-                    )
+                slots = self._get_slot_ids_for_token_range(req_idx, input_batch, 0, num_computed)
+                cached_hs = cache.view(-1, cache.shape[-1])[slots]
 
                 # Slice the hidden states corresponding to this request;
                 # we do this by using the query start
@@ -770,13 +760,3 @@ class OmniTensorPrefixCache:
 
         return combined_hidden_states
 
-    def _get_cached_block_ids(self, req_idx: int, input_batch: InputBatch) -> torch.Tensor:
-        """Given an input batch and request index in the batch (not ID), get the
-        block IDs corresponding to the cache hit.
-        """
-        num_computed = input_batch.num_computed_tokens_cpu[req_idx]
-        # NOTE: vLLM only caches full blocks
-        num_cached_blocks = num_computed // self.block_size
-        # Get the block IDs attached to this cache hit and reindex into
-        # the flattened cached hidden states (i.e., 1 row per token).
-        return input_batch.block_table[0].block_table.cpu[req_idx, :num_cached_blocks]
