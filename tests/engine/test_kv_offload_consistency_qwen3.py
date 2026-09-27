@@ -27,12 +27,11 @@ _THINKER = {"max_model_len": 2048, "max_num_batched_tokens": 2048, "gpu_memory_u
 _DOWNSTREAM = {"1": {"gpu_memory_utilization": 0.3}, "2": {"gpu_memory_utilization": 0.2}}
 
 
-def _run(*, lmcache: bool, prefix_caching: bool, rounds: int, hidden_states: bool = True) -> dict[str, dict]:
+def _run(*, lmcache: bool, rounds: int, hidden_states: bool = True) -> dict[str, dict]:
     return helpers.run(
         model=MODEL,
         overrides=helpers.stage_overrides(
             lmcache=lmcache,
-            prefix_caching=prefix_caching,
             hidden_states=hidden_states,
             thinker_extra=_THINKER,
             downstream_extra=_DOWNSTREAM,
@@ -52,8 +51,8 @@ def test_kv_offload_matches_baseline(hidden_states):
     """
     pytest.importorskip("lmcache", reason="lmcache not installed")
 
-    baseline = _run(lmcache=False, prefix_caching=False, rounds=2)
-    cached = _run(lmcache=True, prefix_caching=False, rounds=2, hidden_states=hidden_states)
+    baseline = _run(lmcache=False, rounds=2)
+    cached = _run(lmcache=True, rounds=2, hidden_states=hidden_states)
 
     assert baseline, "baseline produced no output"
     assert cached, "offload run produced no output"
