@@ -7,6 +7,7 @@ Tests the config bridge that maps omni_kv_config YAML surface to vLLM's
 KV transfer infrastructure (LMCacheConnectorV1).
 """
 
+import logging
 import os
 
 import pytest
@@ -16,6 +17,7 @@ from vllm_omni.engine.arg_utils import (
     _build_lmcache_connector_config,
     _map_offload_config,
     _set_lmcache_env,
+    _warn_if_hidden_state_pool_undersized,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -165,3 +167,30 @@ class TestMapOffloadConfig:
                 os.environ["LMCACHE_CONFIG_FILE"] = saved
             elif "LMCACHE_CONFIG_FILE" in os.environ:
                 os.environ.pop("LMCACHE_CONFIG_FILE")
+
+
+class TestHiddenStatePoolWarning:
+    """The warning has to fire on LMCache's own defaults, which are undersized."""
+
+    def test_warns_when_neither_size_is_given(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _warn_if_hidden_state_pool_undersized({})
+
+        assert "smaller than max_local_cpu_size" in caplog.text
+
+    def test_warns_when_only_the_kv_size_is_raised(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _warn_if_hidden_state_pool_undersized({"lmcache.max_local_cpu_size": 20.0})
+
+        assert "smaller than max_local_cpu_size" in caplog.text
+
+    def test_quiet_when_the_hidden_state_pool_is_large_enough(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _warn_if_hidden_state_pool_undersized(
+                {
+                    "lmcache.max_hidden_state_cpu_size": 8.0,
+                    "lmcache.max_local_cpu_size": 5.0,
+                }
+            )
+
+        assert caplog.text == ""
