@@ -869,7 +869,6 @@ def test_full_payload_output_accumulation_hook_matrix():
 def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
     runner = object.__new__(GPUARModelRunner)
     runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
-    runner.omni_prefix_cache = prefix_cache
     runner.model_config = SimpleNamespace(
         model_arch="IndexTTS25TalkerForConditionalGeneration",
         model_stage="indextts2_5_talker",
@@ -1456,7 +1455,6 @@ def _make_restore_runner(rows_by_layer, num_computed=8, chunk_size=4, mm_keys=()
     runner._has_lmcache = True
     runner._lmcache_hs_mm_keys = mm_keys
     runner._hs_mm_features = {}
-    runner.omni_prefix_cache = None
     engine = SimpleNamespace(
         hidden_state_store=_FakeRetrieveStore(rows_by_layer),
         config=SimpleNamespace(chunk_size=chunk_size),
@@ -1490,27 +1488,6 @@ def test_restore_full_hs_sets_payload():
     assert runner._restored_mm["r1"]["hidden"].shape[0] == 8
 
 
-def test_write_restored_hidden_states_uses_per_request_slots():
-    """#1: restore write must target the request's own slots, not the batch's first-n."""
-    from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
-
-    cache = object.__new__(OmniTensorPrefixCache)
-    cache.block_size = 4
-    cache.hidden_states_cache = torch.zeros(32, 2)  # 8 blocks * 4
-    cache.mm_outputs_cache = {}
-
-    # r0 -> blocks [0,1] (slots 0..7); r1 -> blocks [2,3] (slots 8..15).
-    block_table = torch.tensor([[0, 1, 0, 0], [2, 3, 0, 0]])
-    input_batch = SimpleNamespace(block_table=[SimpleNamespace(block_table=SimpleNamespace(cpu=block_table))])
-
-    hs = torch.ones(6, 2)
-    cache.write_restored_hidden_states(1, input_batch, "hidden", hs)
-
-    # r1's slots 8..13 written; r0's slots 0..7 untouched (the old bug wrote here).
-    assert torch.all(cache.hidden_states_cache[8:14] == 1)
-    assert torch.all(cache.hidden_states_cache[0:8] == 0)
-
-
 def test_restore_remaps_mm_layers_to_flattened_payload_keys():
     """Qwen3-Omni-style captures must land under the flattened payload keys.
 
@@ -1525,33 +1502,6 @@ def test_restore_remaps_mm_layers_to_flattened_payload_keys():
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
 
     assert set(runner._restored_mm["r1"]) == {"hidden", "hidden_states.layer_0", "hidden_states.layer_24"}
-
-
-def test_restore_writes_mm_layers_into_prefix_cache_under_matching_keys():
-    """The mm cache is keyed by the flattened name; a raw "0"/"24" lookup never matches."""
-    from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
-
-    cache = object.__new__(OmniTensorPrefixCache)
-    cache.block_size = 16
-    cache.hidden_states_cache = torch.zeros(64, 2)
-    cache.mm_outputs_cache = {
-        "hidden_states.layer_0": torch.zeros(64, 2),
-        "hidden_states.layer_24": torch.zeros(64, 2),
-    }
-
-    runner, sched_out = _make_restore_runner(
-        rows_by_layer={-1: 8, 0: 8, 24: 8},
-        mm_keys=("0", "24"),
-    )
-    runner.omni_prefix_cache = cache
-    runner.input_batch.block_table = [SimpleNamespace(block_table=SimpleNamespace(cpu=torch.tensor([[0, 1, 2, 3]])))]
-
-    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
-
-    # Rows 1..7 of the fake store are non-zero, so a real write is observable.
-    for key in ("hidden_states.layer_0", "hidden_states.layer_24"):
-        assert cache.mm_outputs_cache[key][:8].abs().sum() > 0, f"{key} was never written"
-    assert cache.hidden_states_cache[:8].abs().sum() > 0
 
 
 def test_pooler_payload_casts_restored_prefix_to_batch_dtype(monkeypatch):
@@ -1651,15 +1601,7 @@ class _StubHSStore:
         return torch.ones(self.rows, self.hidden_size)
 
 
-class _StubPrefixCache:
-    def __init__(self):
-        self.writes = []
-
-    def write_restored_hidden_states(self, req_idx, input_batch, layer_key, hs):
-        self.writes.append((req_idx, layer_key, hs.shape[0]))
-
-
-def _make_dual_consumer_runner(*, stored_rows, prefix_cache, num_computed=8, prompt_tokens=16):
+def _make_stub_restore_runner(*, stored_rows, num_computed=8, prompt_tokens=16):
     runner = object.__new__(LMCacheHiddenStateMixin)
     runner._has_lmcache = True
     runner._lmcache_hs_mm_keys = ()
@@ -1669,7 +1611,6 @@ def _make_dual_consumer_runner(*, stored_rows, prefix_cache, num_computed=8, pro
         config=SimpleNamespace(chunk_size=4),
     )
     runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
-    runner.omni_prefix_cache = prefix_cache
     runner.input_batch = SimpleNamespace(
         req_id_to_index={"r1": 0},
         num_prompt_tokens=[prompt_tokens],
@@ -1679,19 +1620,8 @@ def _make_dual_consumer_runner(*, stored_rows, prefix_cache, num_computed=8, pro
     return runner, sched_out
 
 
-def test_hs_restore_writes_slots_instead_of_stashing_when_prefix_cache_is_on():
-    """Both consumers firing would prepend the same prefix twice."""
-    cache = _StubPrefixCache()
-    runner, sched_out = _make_dual_consumer_runner(stored_rows=8, prefix_cache=cache)
-
-    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
-
-    assert cache.writes == [(0, "hidden", 8)]
-    assert runner._restored_mm == {}
-
-
-def test_hs_restore_stashes_for_the_pooler_without_a_prefix_cache():
-    runner, sched_out = _make_dual_consumer_runner(stored_rows=8, prefix_cache=None)
+def test_hs_restore_stashes_the_prefix_for_the_pooler_payload():
+    runner, sched_out = _make_stub_restore_runner(stored_rows=8)
 
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
 
@@ -1700,12 +1630,10 @@ def test_hs_restore_stashes_for_the_pooler_without_a_prefix_cache():
 
 
 def test_hs_restore_skips_everything_when_the_store_is_short():
-    cache = _StubPrefixCache()
-    runner, sched_out = _make_dual_consumer_runner(stored_rows=5, prefix_cache=cache)
+    runner, sched_out = _make_stub_restore_runner(stored_rows=5)
 
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
 
-    assert cache.writes == []
     assert runner._restored_mm == {}
 
 

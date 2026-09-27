@@ -15,8 +15,6 @@ from vllm.logger import init_logger
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
-    from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
-
 logger = init_logger(__name__)
 
 # Canonical layer_idx for the final hidden-state tap. Using a fixed sentinel (not
@@ -36,7 +34,6 @@ class LMCacheHiddenStateMixin:
     # Supplied by the runner this is mixed into.
     input_batch: "InputBatch"
     query_start_loc: Any
-    omni_prefix_cache: "OmniTensorPrefixCache | None"
 
     def _setup_lmcache_hidden_state_offload(self) -> None:
         """Init HS-offload state and discover the mm taps from the talker config."""
@@ -327,10 +324,7 @@ class LMCacheHiddenStateMixin:
             )
             # mm layers use the flattened payload key; "hidden" stays as-is.
             remapped = {(lk if lk == "hidden" else f"hidden_states.layer_{lk}"): hs for lk, hs in layers.items()}
-            # Exactly one consumer: the merge already picks up the slots we
-            # write, so stashing for the pooler payload too prepends twice.
-            if self.omni_prefix_cache is not None:
-                for cache_key, hs in remapped.items():
-                    self.omni_prefix_cache.write_restored_hidden_states(req_idx, self.input_batch, cache_key, hs)
-            else:
-                self._restored_mm[req_id] = remapped
+            # The pooler payload is the only consumer. A stage that receives KV
+            # through a connector cannot also run the omni prefix cache, so
+            # there is no slot-backed tier to write here.
+            self._restored_mm[req_id] = remapped
