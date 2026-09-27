@@ -91,18 +91,20 @@ is the canonical executable example.
 
 ## Operational notes
 
-- `enable_prefix_caching` is independent. Leave it `false` on the thinker
-  stage that uses LMCache — the LMCache path does not currently coexist
-  with the in-GPU prefix cache for the same blocks.
+- `enable_prefix_caching` must be `false` on the stage that uses LMCache. The
+  engine refuses the combination at kv-cache init: KV received through a
+  connector is reported as `num_computed_tokens` too, and the omni prefix cache
+  cannot tell it from a local hit. Prefix reuse still happens — it is served
+  from LMCache rather than from GPU memory.
 - Make sure `LMCACHE_CONFIG_FILE` (set automatically from
   `lmcache_config.config_file`) or the default config points at a reachable
   backend. Misconfiguration surfaces at engine init, not at first request.
 - Partial HS retrieves can occur when LMCache's HS pool is smaller than the
   KV pool and the HS LRU evicts faster, which the shipped defaults already
   make likely (2 GB against 5 GB). The runner detects this per layer, logs an
-  error, and writes nothing. That is not full protection: the KV hit has
-  already skipped the prefill, and the request stays marked as a cache hit, so
-  the merge still reads those slots. Size the HS pool at least as large as the
-  KV pool until the scheduler can cap the hit at what both tiers cover.
+  error, and restores nothing. The request still degrades: its KV hit has
+  already skipped the prefill, so the talker is conditioned on the suffix
+  alone. Size the HS pool at least as large as the KV pool until the scheduler
+  can cap the hit at what both tiers cover.
 - This recipe targets the AR thinker stage. The diffusion / talker stages
   do not consume `omni_kv_config`.

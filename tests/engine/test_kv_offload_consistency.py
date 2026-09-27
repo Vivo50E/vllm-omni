@@ -43,12 +43,11 @@ _DOWNSTREAM = {
 }
 
 
-def _run(*, lmcache: bool, prefix_caching: bool, rounds: int, hidden_states: bool = True) -> dict[str, dict]:
+def _run(*, lmcache: bool, rounds: int, hidden_states: bool = True) -> dict[str, dict]:
     return helpers.run(
         model=MODEL,
         overrides=helpers.stage_overrides(
             lmcache=lmcache,
-            prefix_caching=prefix_caching,
             hidden_states=hidden_states,
             thinker_extra=_THINKER,
             downstream_extra=_DOWNSTREAM,
@@ -58,25 +57,20 @@ def _run(*, lmcache: bool, prefix_caching: bool, rounds: int, hidden_states: boo
 
 
 @pytest.mark.parametrize("hidden_states", [False, True], ids=["kv_only", "kv_and_hs"])
-@pytest.mark.parametrize("prefix_caching", [False, True], ids=["lmcache_only", "with_prefix_cache"])
-def test_kv_offload_matches_baseline(prefix_caching, hidden_states):
+def test_kv_offload_matches_baseline(hidden_states):
     """Adding LMCache offload must not change what a cache hit produces.
 
     The kv_only case turns the hidden-state store off, so a text failure there is
-    in LMCache's KV restore rather than in the hidden-state path this PR adds.
-    With the in-GPU prefix cache also off it is required to produce no audio at
-    all, which is what shows the hidden-state offload is load-bearing.
+    in LMCache's KV restore rather than in the hidden-state path this PR adds. It
+    is then required to produce no audio at all, which is what shows the
+    hidden-state offload is load-bearing: no other tier can supply them, since a
+    stage on a KV connector may not run the omni prefix cache.
     """
     pytest.importorskip("lmcache", reason="lmcache not installed")
 
     # Round 1 populates the cache; round 2 is served from it.
-    baseline = _run(lmcache=False, prefix_caching=prefix_caching, rounds=2)
-    cached = _run(
-        lmcache=True,
-        prefix_caching=prefix_caching,
-        rounds=2,
-        hidden_states=hidden_states,
-    )
+    baseline = _run(lmcache=False, rounds=2)
+    cached = _run(lmcache=True, rounds=2, hidden_states=hidden_states)
 
     assert baseline, "baseline produced no output"
     assert cached, "offload run produced no output"
@@ -85,7 +79,5 @@ def test_kv_offload_matches_baseline(prefix_caching, hidden_states):
         "baseline produced no audio; the HS restore path is untested without it"
     )
 
-    # Audio only has to disappear when no tier can supply the hidden states: the
-    # in-GPU prefix cache serves them just as well as LMCache's store.
-    problems = helpers.compare(baseline, cached, expect_audio=hidden_states or prefix_caching)
+    problems = helpers.compare(baseline, cached, expect_audio=hidden_states)
     assert not problems, "offload run diverged from the no-offload baseline:\n" + "\n".join(problems)

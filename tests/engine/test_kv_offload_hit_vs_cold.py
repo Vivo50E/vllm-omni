@@ -66,7 +66,6 @@ def test_second_round_matches_first(mode):
         model=MODEL,
         overrides=helpers.stage_overrides(
             lmcache=mode != "off",
-            prefix_caching=False,
             hidden_states=mode == "kv_and_hs",
             thinker_extra=_THINKER,
             downstream_extra=_DOWNSTREAM,

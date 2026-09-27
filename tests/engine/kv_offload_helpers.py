@@ -57,7 +57,6 @@ def prompts(n: int = 3) -> list[dict]:
 def stage_overrides(
     *,
     lmcache: bool,
-    prefix_caching: bool,
     hidden_states: bool = True,
     thinker_extra: dict | None = None,
     downstream_extra: dict[str, dict] | None = None,
@@ -75,7 +74,9 @@ def stage_overrides(
     # breaks the handoff.
     thinker: dict = {
         "max_num_seqs": 4,
-        "enable_prefix_caching": prefix_caching,
+        # Refused alongside a KV connector: the omni prefix cache cannot tell
+        # connector-supplied tokens from a local hit (vllm-project/vllm-omni#6654).
+        "enable_prefix_caching": False,
         "default_sampling_params": dict(GREEDY),
         **(thinker_extra or {}),
     }
