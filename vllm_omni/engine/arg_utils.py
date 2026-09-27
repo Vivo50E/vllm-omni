@@ -164,10 +164,10 @@ def _warn_if_hidden_state_pool_undersized(lmcache_extra: dict) -> None:
     whose KV is still resident. The engine then skips a prefill it cannot supply
     conditioning for, and the request silently degrades.
     """
-    hs_size = lmcache_extra.get("lmcache.max_hidden_state_cpu_size")
-    kv_size = lmcache_extra.get("lmcache.max_local_cpu_size")
-    if hs_size is None or kv_size is None:
-        return
+    # LMCache's own defaults are already undersized, so an absent key is the
+    # case worth warning about rather than one to skip.
+    hs_size = lmcache_extra.get("lmcache.max_hidden_state_cpu_size", 2.0)
+    kv_size = lmcache_extra.get("lmcache.max_local_cpu_size", 5.0)
     try:
         if float(hs_size) >= float(kv_size):
             return

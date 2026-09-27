@@ -98,8 +98,11 @@ is the canonical executable example.
   `lmcache_config.config_file`) or the default config points at a reachable
   backend. Misconfiguration surfaces at engine init, not at first request.
 - Partial HS retrieves can occur when LMCache's HS pool is smaller than the
-  KV pool and the HS LRU evicts faster. The runner detects this case per
-  layer, emits a warning, and skips writing the truncated tensor into the
-  in-GPU prefix cache so downstream stages do not read stale rows.
+  KV pool and the HS LRU evicts faster, which the shipped defaults already
+  make likely (2 GB against 5 GB). The runner detects this per layer, logs an
+  error, and writes nothing. That is not full protection: the KV hit has
+  already skipped the prefill, and the request stays marked as a cache hit, so
+  the merge still reads those slots. Size the HS pool at least as large as the
+  KV pool until the scheduler can cap the hit at what both tiers cover.
 - This recipe targets the AR thinker stage. The diffusion / talker stages
   do not consume `omni_kv_config`.
