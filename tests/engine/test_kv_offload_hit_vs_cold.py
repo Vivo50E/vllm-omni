@@ -31,10 +31,14 @@ MODEL = "Qwen/Qwen2.5-Omni-3B"
 # Every stage shares one card; which card is overridable so two variants of
 # this test can occupy separate GPUs at the same time.
 _DEVICE = os.environ.get("OMNI_TEST_DEVICE", "0")
+# All three stages share one card, and each is its own process with its own CUDA
+# context, so the fractions must leave real headroom rather than summing to ~1.
+# 0.5/0.1/0.05 fits a 40 GB A100 with ECC on; the thinker needs far less than
+# its share for a 3B model at max_model_len 1024.
 _THINKER = {
     "max_model_len": 1024,
     "max_num_batched_tokens": 1024,
-    "gpu_memory_utilization": 0.8,
+    "gpu_memory_utilization": 0.5,
     "devices": _DEVICE,
     "enforce_eager": True,
     "async_chunk": False,
