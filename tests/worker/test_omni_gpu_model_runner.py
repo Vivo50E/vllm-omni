@@ -1497,11 +1497,20 @@ def test_hs_lmcache_regression_resets_state():
     hs_store.calls.clear()
 
     # Request comes back with fewer computed tokens than we had flushed.
-    _drive_step(runner, sched=4, num_computed=2, hs_rows=4)
+    _drive_positioned_step(runner, sched=4, num_computed=2)
 
     # Without the reset, new_boundary (4) <= stale 8 would skip flushing forever.
+    # The buffer now starts at token 2, so the first storable chunk is [4:8) and
+    # nothing is written until it fills -- storing these four rows at offset 0
+    # would file tokens 2..5 as 0..3.
     assert runner._hs_saved_boundary["r1"] == 4
+    assert hs_store.calls == []
+
+    _drive_positioned_step(runner, sched=2, num_computed=6)
+
     assert len(hs_store.calls) == 1
+    assert hs_store.calls[0].token_offset == 4
+    assert _stored_positions(hs_store.calls[0]) == [4, 5, 6, 7]
 
 
 class _FakeRetrieveStore:
@@ -1619,6 +1628,7 @@ def test_hs_lmcache_store_slices_per_request_in_multi_request_batch():
     runner._lmcache_hs_mm_keys = ()
     runner._hs_pending_buffer = {}
     runner._hs_saved_boundary = {}
+    runner._hs_buffer_origin = {}
     runner._hs_mm_features = {}
 
     hs_store = _FakeHSStore()
@@ -1730,9 +1740,13 @@ def test_hs_store_after_a_restore_still_flushes():
 
 
 def test_keyed_token_ids_hash_multimodal_spans():
-    """Hidden states share the KV chunk keys, which have mm spans hashed."""
+    """Hidden states share the KV chunk keys, which have mm spans hashed.
+
+    Asserts the shape of the rewrite rather than the hash value: LMCache has
+    removed and renamed its hashing helpers before, and pinning the value
+    breaks the test without telling us anything about our own contract.
+    """
     pytest.importorskip("lmcache", reason="lmcache not installed")
-    from lmcache.integration.vllm.utils import hex_hash_to_int16
 
     runner = object.__new__(LMCacheHiddenStateMixin)
     runner.input_batch = SimpleNamespace(token_ids_cpu=torch.arange(16).reshape(1, 16))
@@ -1741,10 +1755,11 @@ def test_keyed_token_ids_hash_multimodal_spans():
 
     keyed = runner._keyed_token_ids(0, "r1", 10)
 
-    expected = hex_hash_to_int16("ab" * 16)
-    assert keyed[4:7] == [expected] * 3
     assert keyed[:4] == [0, 1, 2, 3]
     assert keyed[7:] == [7, 8, 9]
+    # The span collapses to one hash-derived value, not the raw placeholder ids.
+    assert len(set(keyed[4:7])) == 1
+    assert keyed[4] not in (4, 5, 6)
 
 
 def test_keyed_token_ids_pass_through_without_multimodal_spans():
