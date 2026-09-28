@@ -835,6 +835,7 @@ def test_full_payload_output_accumulation_hook_matrix():
 
 def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
     runner = object.__new__(GPUARModelRunner)
+    runner.omni_prefix_cache = prefix_cache
     runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
     runner.model_config = SimpleNamespace(
         model_arch="IndexTTS25TalkerForConditionalGeneration",
@@ -1253,6 +1254,7 @@ def _make_lmcache_runner(chunk_size=4, hidden_size=2, req_id="r1", token_capacit
     runner._lmcache_hs_mm_keys = ()
     runner._hs_pending_buffer = {}
     runner._hs_saved_boundary = {}
+    runner._hs_buffer_origin = {}
     runner._hs_mm_features = {}
 
     hs_store = _FakeHSStore()
@@ -1303,6 +1305,71 @@ def test_hs_lmcache_prefill_stores_full_chunks_only():
     assert runner._hs_saved_boundary["r1"] == 8
     # The trailing 2 rows stay in the buffer for the next boundary crossing.
     assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 2
+
+
+def _drive_positioned_step(runner, sched, num_computed, hidden_size=2):
+    """One forward whose every HS row is stamped with its absolute position."""
+    runner.input_batch.num_computed_tokens_cpu = torch.tensor([num_computed])
+    positions = torch.arange(num_computed, num_computed + sched, dtype=torch.float32)
+    hidden_states = positions.unsqueeze(1).repeat(1, hidden_size)
+    LMCacheHiddenStateMixin._maybe_store_hs_to_lmcache(
+        runner,
+        hidden_states,
+        None,
+        num_tokens_unpadded=sched,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={"r1": sched}),
+    )
+
+
+def _stored_positions(call):
+    return [int(v) for v in call.hidden_states[:, 0].tolist()]
+
+
+def test_hs_store_keeps_absolute_positions_after_an_unaligned_hit():
+    """A full-prompt hit leaves num_computed one short of the chunk boundary.
+
+    The buffer then starts mid-chunk. Storing its first rows at the rounded-down
+    boundary would file them under earlier token positions than they hold.
+    """
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # LMCache covered 8 tokens; vLLM must recompute the last one, so the
+    # request arrives with num_computed=7.
+    for step, num_computed in enumerate(range(7, 12)):
+        _drive_positioned_step(runner, sched=1, num_computed=num_computed)
+
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 8
+    assert _stored_positions(call) == [8, 9, 10, 11]
+    assert call.token_ids == list(range(12))
+    assert runner._hs_saved_boundary["r1"] == 12
+
+
+def test_hs_store_positions_stay_aligned_across_two_chunks():
+    """The second flush must continue where the first stopped, not re-skip."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    for num_computed in range(7, 20):
+        _drive_positioned_step(runner, sched=1, num_computed=num_computed)
+
+    assert [c.token_offset for c in hs_store.calls] == [8, 12, 16]
+    assert [_stored_positions(c) for c in hs_store.calls] == [
+        [8, 9, 10, 11],
+        [12, 13, 14, 15],
+        [16, 17, 18, 19],
+    ]
+
+
+def test_hs_store_from_a_cold_request_starts_at_zero():
+    """Rounding up must not shift a request that had no hit at all."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    _drive_positioned_step(runner, sched=10, num_computed=0)
+
+    assert len(hs_store.calls) == 1
+    assert hs_store.calls[0].token_offset == 0
+    assert _stored_positions(hs_store.calls[0]) == list(range(8))
 
 
 def test_hs_lmcache_decode_buffers_until_boundary():
