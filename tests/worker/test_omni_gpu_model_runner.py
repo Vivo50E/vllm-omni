@@ -1742,9 +1742,12 @@ def test_hs_store_after_a_restore_still_flushes():
 def test_keyed_token_ids_hash_multimodal_spans():
     """Hidden states share the KV chunk keys, which have mm spans hashed.
 
-    Asserts the shape of the rewrite rather than the hash value: LMCache has
-    removed and renamed its hashing helpers before, and pinning the value
-    breaks the test without telling us anything about our own contract.
+    Asserts that the span is rewritten and that the rewrite is stable, not what
+    the values are. The keys only have to match whatever LMCache derives for the
+    KV they ride with, and we get that by calling the same helper it does --
+    LMCache has changed both the helper's name and its per-position output
+    before, and pinning either breaks this test without telling us anything
+    about our own contract.
     """
     pytest.importorskip("lmcache", reason="lmcache not installed")
 
@@ -1754,12 +1757,13 @@ def test_keyed_token_ids_hash_multimodal_spans():
     runner._hs_mm_features = {"r1": (["ab" * 16], [placeholder])}
 
     keyed = runner._keyed_token_ids(0, "r1", 10)
+    again = runner._keyed_token_ids(0, "r1", 10)
 
+    # Only the span is touched, and the same request keys the same way twice.
     assert keyed[:4] == [0, 1, 2, 3]
     assert keyed[7:] == [7, 8, 9]
-    # The span collapses to one hash-derived value, not the raw placeholder ids.
-    assert len(set(keyed[4:7])) == 1
-    assert keyed[4] not in (4, 5, 6)
+    assert keyed[4:7] != [4, 5, 6]
+    assert keyed == again
 
 
 def test_keyed_token_ids_pass_through_without_multimodal_spans():
