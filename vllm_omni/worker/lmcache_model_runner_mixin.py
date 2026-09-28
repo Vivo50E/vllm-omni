@@ -39,6 +39,7 @@ class LMCacheHiddenStateMixin:
         """Init HS-offload state and discover the mm taps from the talker config."""
         self._hs_pending_buffer: dict[str, dict[str, list[torch.Tensor]]] = {}
         self._hs_saved_boundary: dict[str, int] = {}
+        self._hs_buffer_origin: dict[str, int] = {}
         self._hs_mm_features: dict[str, tuple[list, list]] = {}
         self._lmcache_hs_mm_keys: tuple[str, ...] = ()
         omni_kv = getattr(getattr(self, "model_config", None), "omni_kv_config", None)
@@ -184,21 +185,26 @@ class LMCacheHiddenStateMixin:
             for layer_key in layers_to_store:
                 req_buf.setdefault(layer_key, []).append(hs_cpu_by_layer[layer_key][start : start + sched])
 
-            # A restored prefix was never buffered here, so accounting has to
-            # start where it ended; leaving the boundary at 0 makes chunk_rows
-            # exceed what the buffer can ever hold and nothing flushes again.
-            if req_id not in self._hs_saved_boundary:
-                self._hs_saved_boundary[req_id] = (num_computed // chunk_size) * chunk_size
+            # A restored prefix was never buffered here, so row 0 of the buffer is
+            # token num_computed, not token 0. Round the first boundary up: a
+            # partial chunk cannot be stored from these rows alone, and it is
+            # already in LMCache -- that is what the hit was.
+            if req_id not in self._hs_buffer_origin:
+                self._hs_buffer_origin[req_id] = num_computed
+                self._hs_saved_boundary[req_id] = -(-num_computed // chunk_size) * chunk_size
 
             saved_boundary = self._hs_saved_boundary[req_id]
             new_boundary = (total // chunk_size) * chunk_size
             if new_boundary <= saved_boundary:
                 continue
 
+            # Rows the buffer holds below saved_boundary belong to the partial
+            # chunk above; they are never stored.
+            skip = saved_boundary - self._hs_buffer_origin[req_id]
             chunk_rows = new_boundary - saved_boundary
             seg_token_ids = self._keyed_token_ids(req_idx, req_id, new_boundary)
             full_bufs = {k: (torch.cat(b, dim=0) if len(b) > 1 else b[0]) for k, b in req_buf.items()}
-            if any(int(fb.shape[0]) < chunk_rows for fb in full_bufs.values()):
+            if any(int(fb.shape[0]) < skip + chunk_rows for fb in full_bufs.values()):
                 continue
 
             all_stored = True
@@ -207,7 +213,7 @@ class LMCacheHiddenStateMixin:
                 try:
                     stored = hs_store.store_hidden_states(
                         seg_token_ids,
-                        full_buf[:chunk_rows],
+                        full_buf[skip : skip + chunk_rows],
                         layer_idx=_hs_layer_idx(layer_key),
                         token_offset=saved_boundary,
                     )
@@ -232,9 +238,10 @@ class LMCacheHiddenStateMixin:
             if not all_stored:
                 continue
             for layer_key, full_buf in full_bufs.items():
-                remainder = full_buf[chunk_rows:]
+                remainder = full_buf[skip + chunk_rows :]
                 req_buf[layer_key] = [remainder] if remainder.shape[0] > 0 else []
             self._hs_saved_boundary[req_id] = new_boundary
+            self._hs_buffer_origin[req_id] = new_boundary
 
     def _take_restored_mm(self, req_ids) -> dict[str, dict[str, torch.Tensor]]:
         """Remove and return the restored prefixes for ``req_ids``."""
@@ -247,6 +254,7 @@ class LMCacheHiddenStateMixin:
         """Discard buffered HS / saved-boundary / restored state for ``req_id``."""
         self._hs_pending_buffer.pop(req_id, None)
         self._hs_saved_boundary.pop(req_id, None)
+        self._hs_buffer_origin.pop(req_id, None)
         self._hs_mm_features.pop(req_id, None)
         restored_mm = getattr(self, "_restored_mm", None)
         if restored_mm is not None:
