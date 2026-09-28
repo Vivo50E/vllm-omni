@@ -104,7 +104,9 @@ is the canonical executable example.
   make likely (2 GB against 5 GB). The runner detects this per layer, logs an
   error, and restores nothing. The request still degrades: its KV hit has
   already skipped the prefill, so the talker is conditioned on the suffix
-  alone. Size the HS pool at least as large as the KV pool until the scheduler
-  can cap the hit at what both tiers cover.
+  alone. Sizing the HS pool at least as large as the KV pool makes this less
+  likely, but it is not a correctness guarantee — the pools still evict
+  independently. The guarantee needs the scheduler to cap the hit at what both
+  tiers cover.
 - This recipe targets the AR thinker stage. The diffusion / talker stages
   do not consume `omni_kv_config`.
