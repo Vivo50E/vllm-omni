@@ -87,11 +87,7 @@ def _run(model: str, mode: str, num_prompts: int = 3) -> bool:
     outputs = omni.generate(prompts, sampling_params_list)
     omni.close()
 
-    return any(
-        out.request_output and out.request_output.outputs and out.request_output.outputs[0].text.strip()
-        for out in outputs
-        if out.final_output_type == "text"
-    )
+    return any(out.outputs and out.outputs[0].text.strip() for out in outputs if out.final_output_type == "text")
 
 
 @pytest.mark.parametrize("mode", list(MODES.keys()))
