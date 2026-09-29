@@ -1547,6 +1547,8 @@ def _make_restore_runner(rows_by_layer, num_computed=8, chunk_size=4, mm_keys=()
 
 def test_restore_incomplete_hs_sets_no_payload():
     """#2: a missing required layer must not produce a partial payload."""
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
     runner, sched_out = _make_restore_runner(rows_by_layer={-1: None})  # "hidden" (idx -1) misses
 
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
@@ -1556,6 +1558,8 @@ def test_restore_incomplete_hs_sets_no_payload():
 
 def test_restore_full_hs_sets_payload():
     """#2: all required layers present -> payload is set."""
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
     runner, sched_out = _make_restore_runner(rows_by_layer={-1: 8})  # "hidden" (idx -1) full-length
 
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
@@ -1570,6 +1574,8 @@ def test_restore_remaps_mm_layers_to_flattened_payload_keys():
     Only models exposing talker_config.accept_hidden_layer populate
     _lmcache_hs_mm_keys, so this path never runs on Qwen2.5-Omni.
     """
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
     runner, sched_out = _make_restore_runner(
         rows_by_layer={-1: 8, 0: 8, 24: 8},  # "hidden" (-1) plus captures 0 and 24
         mm_keys=("0", "24"),
@@ -1698,6 +1704,8 @@ def _make_stub_restore_runner(*, stored_rows, num_computed=8, prompt_tokens=16):
 
 
 def test_hs_restore_stashes_the_prefix_for_the_pooler_payload():
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
     runner, sched_out = _make_stub_restore_runner(stored_rows=8)
 
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
@@ -1707,6 +1715,8 @@ def test_hs_restore_stashes_the_prefix_for_the_pooler_payload():
 
 
 def test_hs_restore_skips_everything_when_the_store_is_short():
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
     runner, sched_out = _make_stub_restore_runner(stored_rows=5)
 
     LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
