@@ -18,6 +18,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoConfig, CLIPTextModel, CLIPTokenizer, T5TokenizerFast
+from vllm.model_executor.models.transformers.utils import init_on_device_without_buffers
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -30,6 +31,7 @@ from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.utils import init_parameters, recursive_replace_linear
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -94,6 +96,13 @@ class FluxPipeline(
             ),
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=None,
+                prefix="text_encoder.",
+                fall_back_to_pt=True,
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
                 subfolder="text_encoder_2",
                 revision=None,
                 prefix="text_encoder_2.",
@@ -109,11 +118,22 @@ class FluxPipeline(
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self.device)
+
+        # CLIP: meta-init + swap to vLLM linears so quant_config applies; loader
+        # streams weights, so no .to() (same as the DiT).
+        clip_config = AutoConfig.from_pretrained(model, subfolder="text_encoder", local_files_only=local_files_only)
+        with init_on_device_without_buffers("meta"):
+            self.text_encoder = CLIPTextModel._from_config(clip_config)
+        recursive_replace_linear(self.text_encoder, od_config)
+        init_parameters(self.text_encoder, dtype=od_config.dtype, device=self.device)
+
+        # T5 already uses vLLM linears; thread quant_config to quantize its GEMMs.
         t5_config = AutoConfig.from_pretrained(model, subfolder="text_encoder_2", local_files_only=local_files_only)
-        self.text_encoder_2 = T5EncoderModel(t5_config, prefix="text_encoder_2").to(self.device)
+        self.text_encoder_2 = T5EncoderModel(
+            t5_config, prefix="text_encoder_2", quant_config=od_config.quantization_config
+        )
+
+        # VAE is precision-sensitive and kept at full precision.
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
@@ -502,38 +522,14 @@ class FluxPipeline(
             return False
         return True
 
-    def forward(
-        self,
-        req: DiffusionRequestBatch,
-        prompt: str | list[str] | None = None,
-        prompt_2: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        negative_prompt_2: str | list[str] | None = None,
-        true_cfg_scale: float = 1.0,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int = 28,
-        sigmas: list[float] | None = None,
-        guidance_scale: float = 3.5,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.FloatTensor | None = None,
-        prompt_embeds: torch.FloatTensor | None = None,
-        pooled_prompt_embeds: torch.FloatTensor | None = None,
-        negative_prompt_embeds: torch.FloatTensor | None = None,
-        negative_pooled_prompt_embeds: torch.FloatTensor | None = None,
-        output_type: str | None = "pil",
-        return_dict: bool = True,
-        joint_attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
-    ) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Forward pass for flux."""
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         sampling_params_list = req.sampling_params_list
         common_sampling_params = sampling_params_list[0]
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
+
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
             negative_prompt = None
         elif req.prompts:
@@ -541,40 +537,39 @@ class FluxPipeline(
 
         height = common_sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = common_sampling_params.width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = common_sampling_params.num_inference_steps or num_inference_steps
-        sigmas = common_sampling_params.sigmas or sigmas
-        guidance_scale = (
-            common_sampling_params.guidance_scale
-            if common_sampling_params.guidance_scale is not None
-            else guidance_scale
-        )
-        true_cfg_scale = common_sampling_params.true_cfg_scale or true_cfg_scale
+        num_inference_steps = common_sampling_params.num_inference_steps or 28
+        sigmas = common_sampling_params.sigmas
+        guidance_scale = common_sampling_params.guidance_scale
+        true_cfg_scale = common_sampling_params.true_cfg_scale or 1.0
         num_images_per_prompt = (
-            common_sampling_params.num_outputs_per_prompt
-            if common_sampling_params.num_outputs_per_prompt > 0
-            else num_images_per_prompt
+            common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
         )
-        generator = req.collate_request_generators(num_images_per_prompt, generator)
-        latents = req.collate_request_tensors("latents", latents)
+        max_sequence_length = common_sampling_params.max_sequence_length or 512
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        latents = req.collate_request_tensors("latents", None)
         prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
             req.prompts,
             {
-                "prompt_embeds": prompt_embeds,
-                "negative_prompt_embeds": negative_prompt_embeds,
-                "pooled_prompt_embeds": pooled_prompt_embeds,
-                "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
+                "prompt_embeds": None,
+                "negative_prompt_embeds": None,
+                "pooled_prompt_embeds": None,
+                "negative_pooled_prompt_embeds": None,
             },
         )
         prompt_embeds = prompt_fields["prompt_embeds"]
         negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
         pooled_prompt_embeds = prompt_fields["pooled_prompt_embeds"]
         negative_pooled_prompt_embeds = prompt_fields["negative_pooled_prompt_embeds"]
+        prompt_2 = None
+        negative_prompt_2 = None
         if prompt_embeds is not None:
             prompt = None
-            prompt_2 = None
         if negative_prompt_embeds is not None:
             negative_prompt = None
-            negative_prompt_2 = None
+
+        output_type = common_sampling_params.output_type or "pil"
+        joint_attention_kwargs: dict[str, Any] | None = None
+        callback_on_step_end_tensor_inputs = ["latents"]
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -598,9 +593,7 @@ class FluxPipeline(
         self._interrupt = False
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
+        if prompt is not None:
             batch_size = len(prompt)
         else:
             batch_size = prompt_embeds.shape[0]
@@ -706,7 +699,20 @@ class FluxPipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(self._remap_clip_weights(weights))
+
+    @staticmethod
+    def _remap_clip_weights(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        # transformers>=5 flattened CLIPTextModel (drops the text_model. prefix);
+        # replicate the from_pretrained remap that meta-init bypasses.
+        legacy_prefix = "text_encoder.text_model."
+        new_prefix = "text_encoder."
+        for name, weight in weights:
+            if name.startswith(legacy_prefix):
+                name = new_prefix + name[len(legacy_prefix) :]
+            yield name, weight
 
 
 class FluxDMD2Pipeline(DMD2PipelineMixin, FluxPipeline):

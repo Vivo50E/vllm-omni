@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """VoxCPM2 AR talker — PagedAttention pipeline with per-request state.
 
 Architecture:
@@ -16,12 +16,15 @@ import hashlib
 import logging
 import math
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
+from functools import lru_cache
 from types import MethodType
-from typing import Any
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypedDict
 
+import numpy as np
 import torch
 import torch.nn as nn
+from typing_extensions import Unpack
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.inputs import tokens_input
@@ -35,20 +38,28 @@ from vllm.multimodal.audio import AudioResampler
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+import vllm_omni.platforms as omni_platform
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
+    validate_voxcpm2_profile,
 )
+from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
+from .lora import merge_voxcpm2_lora
 from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
+from .runtime_config import _VoxCPM2RuntimeConfig
 from .voxcpm2_import_utils import import_voxcpm2_core
+
+if TYPE_CHECKING:
+    from .model_state import VoxCPM2BatchSlots
 
 logger = init_logger(__name__)
 
 _ENABLE_NVTX_PROFILE = False
+
 
 # Lower bound for the _active_states leak-warn threshold.  The effective
 # threshold is max(_ACTIVE_STATE_LEAK_WARN_MIN, 4 * max_batch_size) so small
@@ -56,103 +67,78 @@ _ENABLE_NVTX_PROFILE = False
 _ACTIVE_STATE_LEAK_WARN_MIN = 512
 
 
-@dataclasses.dataclass(frozen=True)
-class _VoxCPM2RuntimeConfig:
-    enable_profiling: bool = False
-    enable_nvtx_profile: bool = False
-    enable_loc_dit_layer_nvtx: bool = False
-    enable_loc_dit_fused_qkv: bool = True
-    enable_loc_dit_fused_mlp: bool = True
-    enable_loc_dit_zero_dt_cache: bool = True
-    enable_loc_dit_fast_rope: bool = False
-    enable_loc_dit_skip_qkv_contig: bool = True
-    enable_loc_dit_reduce_overhead_no_cg: bool = False
-    enable_loc_dit_fullgraph_no_cg: bool = False
-    cfg_cutoff_ratio: float = 1.0
-    decode_graph_capture_policy: str = "all"
-    enable_vae_cuda_graph: bool = False
-    enable_cfm_cuda_graph: bool = False
-    enable_cfm_prealloc_output: bool = False
-    enable_batched_cfm: bool = True
-    deterministic_cfm_noise: bool = False
-    deterministic_cfm_seed: int = 20260601
-    audio_emit_every: int = 1
-    vae_decode_every: int = 3
-    enable_delayed_audio_copy: bool = False
-    delayed_audio_copy_use_events: bool = False
-    coalesce_audio_d2h: bool = True
-    enable_batched_vae_decode: bool = True
-    enable_batched_fsq_fusion: bool = False
-    batched_fsq_fusion_max_batch: int = 32
+class _VoxCPM2PromptConfigLike(Protocol):
+    audio_vae_config: dict[str, Any]
+    patch_size: int
 
-    @classmethod
-    def from_vllm_config(cls, vllm_config: VllmConfig) -> _VoxCPM2RuntimeConfig:
-        model_config = vllm_config.model_config
-        raw = getattr(model_config, "voxcpm2_runtime_config", None)
-        if raw is None:
-            raw = getattr(getattr(model_config, "hf_config", None), "voxcpm2_runtime_config", None)
-        if raw is None:
-            return cls()
-        if hasattr(raw, "to_dict"):
-            raw = raw.to_dict()
-        elif not isinstance(raw, dict) and hasattr(raw, "__dict__"):
-            raw = vars(raw)
-        if not isinstance(raw, dict):
-            logger.warning("Ignoring invalid voxcpm2_runtime_config=%r; expected a dict.", raw)
-            return cls()
 
-        fields = {field.name: field for field in dataclasses.fields(cls)}
-        values: dict[str, Any] = {}
-        for key, value in raw.items():
-            if key not in fields:
-                logger.warning("Ignoring unknown VoxCPM2 runtime config key: %s", key)
-                continue
-            default = getattr(cls(), key)
-            values[key] = cls._coerce_value(key, value, default)
-        return cls(**values)._normalized()
+class _AttentionMetadataLike(Protocol):
+    scheduler_metadata: Any
 
-    def _normalized(self) -> _VoxCPM2RuntimeConfig:
-        cfg = self
-        if cfg.enable_batched_cfm and cfg.enable_cfm_cuda_graph:
-            logger.warning(
-                "VoxCPM2 batched CFM and CFM CUDA Graph are mutually exclusive; "
-                "disabling CFM CUDA Graph and keeping batched CFM."
-            )
-            cfg = dataclasses.replace(cfg, enable_cfm_cuda_graph=False)
-        if cfg.enable_cfm_prealloc_output and not cfg.enable_cfm_cuda_graph:
-            logger.warning("VoxCPM2 CFM preallocated output requires CFM CUDA Graph; disabling it.")
-            cfg = dataclasses.replace(cfg, enable_cfm_prealloc_output=False)
-        if cfg.delayed_audio_copy_use_events and not cfg.enable_delayed_audio_copy:
-            logger.warning("VoxCPM2 delayed audio copy events require delayed audio copy; disabling event polling.")
-            cfg = dataclasses.replace(cfg, delayed_audio_copy_use_events=False)
-        if cfg.enable_batched_vae_decode and (
-            cfg.enable_delayed_audio_copy or cfg.audio_emit_every > 1 or cfg.enable_vae_cuda_graph
-        ):
-            logger.warning(
-                "VoxCPM2 batched VAE decode is incompatible with delayed audio copy, "
-                "audio_emit_every > 1, and VAE CUDA Graph; disabling batched VAE decode."
-            )
-            cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
-        return cfg
 
-    @staticmethod
-    def _coerce_value(key: str, value: Any, default: Any) -> Any:
-        if isinstance(default, bool):
-            if isinstance(value, str):
-                return value.strip().lower() in ("1", "true", "yes", "on")
-            return bool(value)
-        if isinstance(default, int) and not isinstance(default, bool):
-            value = int(value)
-            if key in {"audio_emit_every", "vae_decode_every", "batched_fsq_fusion_max_batch"}:
-                return max(1, value)
-            return value
-        if isinstance(default, float):
-            if key == "cfg_cutoff_ratio":
-                return min(1.0, max(0.0, float(value)))
-            return float(value)
-        if isinstance(default, str):
-            return str(value)
-        return value
+class _ForwardContextLike(Protocol):
+    attn_metadata: dict[str, _AttentionMetadataLike] | Any
+
+
+class VoxCPM2PreprocessInput(TypedDict, total=False):
+    # Shared input data and MRV1 request identity.
+    additional_information: dict[str, Any]
+    request_id: str
+    _omni_seed: int | None
+    _omni_max_tokens: int | None
+    _omni_prompt_len: int
+    _omni_num_computed_tokens: int
+    _omni_is_prefill: bool
+    text_token_ids: list[list[int]]
+    reference_audio: object
+    ref_audio: object
+    prompt_audio: object
+    prompt_text: str | list[str] | None
+    voice_profile: dict[str, Any] | list[dict[str, Any]] | None
+    voice_name: str | list[str] | None
+    voice_created_at: int | str | None
+
+    # V2 runner identity, slot ownership, batch position, and prepared prefill data.
+    req_id: str
+    slot_index: int
+    batch_row: int
+    prefill_text_embed: torch.Tensor
+    prepared_prefill: _PreparedPrefill
+
+
+class VoxCPM2PostprocessInput(TypedDict, total=False):
+    # MRV1 identity.
+    request_id: str
+    # V2 runner identity and slot ownership.
+    req_id: str
+    slot_index: int
+
+
+class _PrefillInputs(NamedTuple):
+    text_token: torch.Tensor
+    audio_feat: torch.Tensor
+    text_mask: torch.Tensor
+    audio_mask: torch.Tensor
+
+
+class _PreparedPrefill(NamedTuple):
+    """V2 batched voice prefill data reused by per-request preprocess."""
+
+    prompt_cache: dict[str, Any]
+    embeds: torch.Tensor
+    text_mask: torch.Tensor
+    audio_mask: torch.Tensor
+    audio_feat: torch.Tensor
+    feat_embed: torch.Tensor
+
+
+class _PrefillResidualMeta(NamedTuple):
+    lm_hidden: torch.Tensor
+    prefix_feat_cond: torch.Tensor
+
+
+class _DecodeResidualMeta(NamedTuple):
+    new_lm_hidden: torch.Tensor
 
 
 def is_cjk_char(c: str) -> bool:
@@ -195,11 +181,11 @@ def split_multichar_chinese(token_ids: list[int], split_map: dict[int, list[int]
 
 
 def build_voxcpm2_prompt(
-    hf_config: Any,
+    hf_config: _VoxCPM2PromptConfigLike,
     tokenizer: Any,
     split_map: dict[int, list[int]],
     text: str,
-    ref_audio: Any | None = None,
+    ref_audio: Sequence[float] | torch.Tensor | bytes | None = None,
     ref_sr: int | None = None,
     ref_text: str | None = None,
     voice_profile: dict[str, Any] | None = None,
@@ -207,7 +193,7 @@ def build_voxcpm2_prompt(
     """Build a VoxCPM2 prefill prompt whose ``prompt_token_ids`` length matches
     the talker-side prefill length.
 
-    Used by both online serving (``serving_speech._build_voxcpm2_prompt``) and
+    Used by both online serving (``VoxCPM2Adapter._build_prompt``) and
     the offline example, so the talker-side length assertion never fires.
     """
     ids = split_multichar_chinese(tokenizer.encode(text, add_special_tokens=True), split_map)
@@ -234,9 +220,14 @@ def build_voxcpm2_prompt(
                 prefill_len += len(prompt_ids)
             prefill_len += audio_feat_len
     elif ref_audio is not None:
+        if ref_sr is None:
+            raise ValueError("VoxCPM2 ref_sr is required when ref_audio is provided.")
         vae = hf_config.audio_vae_config
         patch_samples = hf_config.patch_size * math.prod(vae["encoder_rates"])
-        ref_len = math.ceil(math.ceil(len(ref_audio) * vae["sample_rate"] / ref_sr) / patch_samples)
+        if isinstance(ref_audio, bytes) and len(ref_audio) % np.dtype(np.float32).itemsize:
+            raise ValueError("VoxCPM2 ref_audio bytes must contain float32 samples")
+        num_samples = len(ref_audio) // 4 if isinstance(ref_audio, bytes) else len(ref_audio)
+        ref_len = math.ceil(math.ceil(num_samples * vae["sample_rate"] / ref_sr) / patch_samples)
         if ref_text is not None:
             additional["prompt_audio"] = [[ref_audio, ref_sr]]
             additional["prompt_text"] = [ref_text]
@@ -252,26 +243,45 @@ def build_voxcpm2_prompt(
     return prompt
 
 
+@lru_cache(maxsize=32)
+def _audio_resampler_on_device(orig_sr: int, target_sr: int, device: torch.device) -> nn.Module:
+    import torchaudio
+
+    return torchaudio.transforms.Resample(orig_sr, target_sr).to(device)
+
+
 def _encode_raw_audio(
     tts: nn.Module,
-    samples: list[float] | torch.Tensor,
+    samples: list[float] | torch.Tensor | bytes,
     sr: int,
     padding_mode: str = "right",
+    keep_on_device: bool = False,
 ) -> torch.Tensor:
     """Encode raw audio samples using the native VoxCPM2 AudioVAE.
 
     Mirrors ``VoxCPM2Model._encode_wav`` but accepts in-memory samples
     instead of a file path (needed for the OpenAI speech API).
     """
-    if isinstance(samples, list):
-        audio = torch.tensor(samples, dtype=torch.float32)
+    if isinstance(samples, bytes):
+        if len(samples) % np.dtype(np.float32).itemsize:
+            raise ValueError("VoxCPM2 audio bytes must contain float32 samples")
+        audio = torch.from_numpy(np.frombuffer(samples, dtype=np.float32).copy())
+    elif isinstance(samples, list):
+        audio = torch.from_numpy(np.asarray(samples, dtype=np.float32))
     else:
         audio = samples.float()
     if audio.ndim == 1:
         audio = audio.unsqueeze(0)
 
+    vae_device = next(tts.audio_vae.parameters()).device
     encode_sr = tts._encode_sample_rate
-    if sr != encode_sr:
+    if keep_on_device:
+        if audio.device.type == "cpu" and vae_device.type == "cuda":
+            audio = audio.pin_memory()
+        audio = audio.to(vae_device, non_blocking=True)
+        if sr != encode_sr:
+            audio = _audio_resampler_on_device(sr, encode_sr, vae_device)(audio)
+    elif sr != encode_sr:
         audio_np = audio.squeeze(0).numpy()
         resampler = AudioResampler(target_sr=encode_sr)
         audio_np = resampler.resample(audio_np, orig_sr=sr)
@@ -284,7 +294,9 @@ def _encode_raw_audio(
         audio = torch.nn.functional.pad(audio, pad)
 
     vae_device = next(tts.audio_vae.parameters()).device
-    feat = tts.audio_vae.encode(audio.to(vae_device), encode_sr).cpu()
+    feat = tts.audio_vae.encode(audio.to(vae_device), encode_sr)
+    if not keep_on_device:
+        feat = feat.cpu()
     return feat.view(tts.audio_vae.latent_dim, -1, tts.patch_size).permute(1, 2, 0)
 
 
@@ -296,6 +308,10 @@ def _encode_raw_audio(
 @dataclasses.dataclass
 class _RequestState:
     request_id: str
+    # Per-request CFM noise generator, seeded once from the request's seed at
+    # first prefill chunk (runner passes it as ``_omni_seed``). None means the
+    # request carried no seed and draws noise from the global RNG stream.
+    cfm_generator: torch.Generator | None = None
     curr_embed_for_next: torch.Tensor | None = None
     prev_feat_embed: torch.Tensor | None = None
     curr_prefix_feat_cond: torch.Tensor | None = None
@@ -312,10 +328,38 @@ class _RequestState:
     decode_step_count: int = 0
     request_start_time: float = 0.0
     prefill_completed: bool = False
+    is_last_prefill_chunk: bool = False
     prompt_cache: dict | None = None
     prefill_masks: tuple | None = None
     is_stopping: bool = False
     precomputed_is_stopping: bool | None = None
+    prefill_embeds: torch.Tensor | None = None
+    # Flush tail audio when the scheduler reaches the generation length limit.
+    audio_length_limit_reached: bool = False
+
+
+def patch_is_valid(state, is_prefill: bool) -> bool:
+    # Intermediate prefill chunks still write LM KV, but cannot commit a patch.
+    # A newly stopping step remains valid; only previously stopped rows are masked.
+    return not state.is_stopping and (not is_prefill or state.is_last_prefill_chunk)
+
+
+def mixed_request_is_ready(state, is_prefill: bool, per_patch_audio: bool) -> bool:
+    if is_prefill:
+        return per_patch_audio or state.is_last_prefill_chunk
+    return state.decode_state_ready
+
+
+def finish_graph_prefills(pending_requests) -> None:
+    """Release prefill inputs only after the final chunk produced its patch."""
+    for state, is_prefill, _, _ in pending_requests:
+        if is_prefill and state.is_last_prefill_chunk:
+            state.decode_step_count = 0
+            state.request_start_time = time.perf_counter()
+            state.prefill_completed = True
+            state.prefill_embeds = None
+            state.prefill_masks = None
+            state.prompt_cache = None
 
 
 @dataclasses.dataclass
@@ -344,6 +388,56 @@ class _CapturedCFMGraph:
 
 
 @dataclasses.dataclass
+class _CapturedUnifiedDecodeGraph:
+    graph: torch.cuda.CUDAGraph
+    batch_size: int
+    # Static input buffers (copied before replay)
+    input_embeds: torch.Tensor
+    positions: torch.Tensor
+    prev_feat_embed: torch.Tensor
+    prefix_feat_cond: torch.Tensor
+    # Static output buffers (read after replay)
+    next_feat_embed: torch.Tensor
+    cfm_output: torch.Tensor
+    lm_hidden: torch.Tensor
+    # Internal buffers for CFM solver
+    cfm_buffers: _CFMBufferManager
+    cfm_noise: torch.Tensor
+    text_mask: torch.Tensor | None = None
+    last_token_indices: torch.Tensor | None = None
+    patch_indices: torch.Tensor | None = None
+    scaffold_hidden: torch.Tensor | None = None
+    pcm: torch.Tensor | None = None
+    pcm_valid: torch.Tensor | None = None
+    stop_logits: torch.Tensor | None = None
+    audio_slots: torch.Tensor | None = None
+    audio_rows_valid: torch.Tensor | None = None
+    audio_copy_event: torch.cuda.Event | None = None
+
+
+@dataclasses.dataclass
+class _UnifiedDecodeGraphStats:
+    captures: int = 0
+    replays: int = 0
+    skips: dict[str, int] = dataclasses.field(default_factory=dict)
+    real_batch_sizes: dict[int, int] = dataclasses.field(default_factory=dict)
+    graph_bucket_sizes: dict[int, int] = dataclasses.field(default_factory=dict)
+    logged_replays: int = 0
+    logged_skips: int = 0
+
+    def record_skip(self, reason: str) -> None:
+        self.skips[reason] = self.skips.get(reason, 0) + 1
+
+    def record_replay_batch(self, *, real_batch_size: int, graph_bucket_size: int) -> None:
+        self.real_batch_sizes[real_batch_size] = self.real_batch_sizes.get(real_batch_size, 0) + 1
+        self.graph_bucket_sizes[graph_bucket_size] = self.graph_bucket_sizes.get(graph_bucket_size, 0) + 1
+
+    @property
+    def total_skips(self) -> int:
+        return sum(self.skips.values())
+
+
+@dataclasses.dataclass
 class _PendingAudioCopy:
     host: torch.Tensor
     event: torch.cuda.Event | None = None
@@ -356,20 +450,44 @@ class _PendingAudioCopy:
 # ===================================================================
 
 
+class _TimingEvent(Protocol):
+    def record(self) -> None: ...
+
+    def elapsed_time(self, end_event: _TimingEvent) -> float: ...
+
+
 class _PerfTimer:
-    __slots__ = ("_enabled", "_timers", "_counts", "_starts", "_pairs")
+    __slots__ = (
+        "_enabled",
+        "_device_module",
+        "_timers",
+        "_counts",
+        "_starts",
+        "_pairs",
+    )
 
     def __init__(self, enabled: bool = False):
         self._enabled = enabled
+        self._device_module = None
+        if enabled:
+            device_module = torch.get_device_module(omni_platform.current_omni_platform.get_torch_device())
+            if not hasattr(device_module, "Event"):
+                logger.warning_once(
+                    "VoxCPM2 profiler disabled: the current device does not provide accelerator timing events"
+                )
+                self._enabled = False
+            else:
+                self._device_module = device_module
         self._timers: dict[str, float] = {}
         self._counts: dict[str, int] = {}
-        self._starts: dict[str, torch.cuda.Event] = {}
-        self._pairs: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self._starts: dict[str, _TimingEvent] = {}
+        self._pairs: list[tuple[str, _TimingEvent, _TimingEvent]] = []
 
     def start(self, name: str) -> None:
         if not self._enabled:
             return
-        evt = torch.cuda.Event(enable_timing=True)
+        assert self._device_module is not None
+        evt = self._device_module.Event(enable_timing=True)
         evt.record()
         self._starts[name] = evt
 
@@ -377,7 +495,8 @@ class _PerfTimer:
         if not self._enabled or name not in self._starts:
             return
         start_evt = self._starts.pop(name)
-        end_evt = torch.cuda.Event(enable_timing=True)
+        assert self._device_module is not None
+        end_evt = self._device_module.Event(enable_timing=True)
         end_evt.record()
         self._pairs.append((name, start_evt, end_evt))
 
@@ -386,7 +505,18 @@ class _PerfTimer:
             return
         torch.accelerator.synchronize()
         for name, s, e in self._pairs:
-            self._timers[name] = self._timers.get(name, 0.0) + s.elapsed_time(e)
+            try:
+                elapsed_ms = s.elapsed_time(e)
+            except RuntimeError as error:
+                # An event recorded during accelerator graph capture may not
+                # own a runtime recorder. Profiling must not fail inference.
+                logger.warning_once(
+                    "VoxCPM2 profiler discarded invalid event pair %r: %s",
+                    name,
+                    error,
+                )
+                continue
+            self._timers[name] = self._timers.get(name, 0.0) + elapsed_ms
             self._counts[name] = self._counts.get(name, 0) + 1
         self._pairs.clear()
 
@@ -839,6 +969,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
         self._runtime_config = _VoxCPM2RuntimeConfig.from_vllm_config(vllm_config)
+        self._startup_lora_applied = False
+        if self._runtime_config.startup_lora_path and vllm_config.load_config.load_format == "dummy":
+            raise ValueError("VoxCPM2 startup LoRA requires real base weights; load_format=dummy is unsupported")
         global _ENABLE_NVTX_PROFILE
         _ENABLE_NVTX_PROFILE = self._runtime_config.enable_nvtx_profile
 
@@ -864,7 +997,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # the checkpoint download/read cost at construction time; DummyModelLoader
         # will then randomize the just-loaded _tts params — this is intended.
         model_path = vllm_config.model_config.model
-        self._device = current_omni_platform.get_torch_device()
+        self._device = omni_platform.current_omni_platform.get_torch_device()
         VoxCPM = import_voxcpm2_core()
         native = VoxCPM.from_pretrained(model_path, load_denoiser=False, optimize=False)
         self._tts: nn.Module = native.tts_model.to(self._device)
@@ -882,15 +1015,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._tts.residual_lm = None
         torch.accelerator.empty_cache()
 
-        self._inference_timesteps = 10
-        self._cfg_value = 2.0
+        self._inference_timesteps = self._runtime_config.inference_timesteps
+        self._cfg_value = self._runtime_config.cfg_value
         self._cfg_cutoff_ratio = self._runtime_config.cfg_cutoff_ratio
         # Number of trailing latent frames to keep as VAE receptive-field context
         # for sliding-window streaming decode. 12 matches the nanovllm reference
         # implementation and covers the longest VAE decoder receptive field.
         self._n_decode_pad_frames = 12
-        use_cuda_graph = current_omni_platform.is_cuda()
-        self._enable_torch_compile = current_omni_platform.supports_torch_inductor()
+        use_cuda_graph = omni_platform.current_omni_platform.is_cuda()
+        self._enable_torch_compile = omni_platform.current_omni_platform.supports_torch_inductor()
         self._compile_vae = self._enable_torch_compile
         self._max_decode_steps = 2000
         self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
@@ -925,14 +1058,29 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._batched_fsq_fusion_max_batch = self._runtime_config.batched_fsq_fusion_max_batch
         self._audio_copy_stream: torch.cuda.Stream | None = None
         self._max_cached_graphs = self._max_batch_size
+        self._mixed_graph_cache_limit = self._runtime_config.mixed_graph_cache_limit
         self._cuda_graph_warmup_steps = 0
         self._cuda_graph_warmup_threshold = 3
+        self._unified_graphs: dict[int | tuple[int, int], _CapturedUnifiedDecodeGraph] = {}
+        self._enable_unified_decode_graph = self._runtime_config.unified_decode_graph_available(
+            use_cuda_graph=use_cuda_graph
+        )
+        self._unified_decode_graph_max_batch_size = self._runtime_config.unified_decode_graph_max_batch_size
+        self._unified_graph_bucket_sizes: frozenset[int] = self._build_unified_graph_bucket_sizes(
+            min(self._max_batch_size, self._unified_decode_graph_max_batch_size)
+        )
+        self._unified_graph_stats = _UnifiedDecodeGraphStats()
+        self._mixed_graphs: dict[tuple[int, int] | tuple[int, int, int], _CapturedUnifiedDecodeGraph] = {}
+        self._runner_assisted_unified_decode_graph_active = False
+        self._runner_assisted_unified_decode_graph_batch_size = 0
 
         self._multichar_zh_split: dict[int, list[int]] | None = None
 
         self._active_states: dict[str, _RequestState] = {}
+        self._mrv2_model_state: Any | None = None
         self._current_request_id: str | None = None
         self._pending_requests: list[tuple[str, bool, torch.Tensor | None, int]] = []
+        self._pending_batch_rows: list[int] | None = None
         self._results_queue: list[tuple[str, torch.Tensor | None]] = []
         self._audio_queue: list[tuple[str, Any]] = []
         self._last_audio_output_req_ids: list[str] = []
@@ -956,9 +1104,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if not custom_voice_dir:
             return
 
+        work_device = self._device if self.vllm_config.model_config.use_v2_model_runner else torch.device("cpu")
         loaded = 0
         for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="voxcpm2"):
-            tensors = load_validated_profile_tensors(profile, expected_model_type="voxcpm2")
+            tensors = load_validated_profile_tensors(
+                profile,
+                expected_model_type="voxcpm2",
+                validate_profile=validate_voxcpm2_profile,
+            )
             if tensors is None:
                 continue
 
@@ -968,9 +1121,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
             prompt_cache: dict[str, Any] = {"mode": mode}
             if ref_audio_feat is not None:
-                prompt_cache["ref_audio_feat"] = ref_audio_feat.contiguous().cpu()
+                prompt_cache["ref_audio_feat"] = ref_audio_feat.contiguous().to(work_device)
             if audio_feat is not None:
-                prompt_cache["audio_feat"] = audio_feat.contiguous().cpu()
+                prompt_cache["audio_feat"] = audio_feat.contiguous().to(work_device)
             prompt_text = profile.get("prompt_text") or profile.get("ref_text")
             if isinstance(prompt_text, str) and prompt_text:
                 prompt_cache["prompt_text"] = prompt_text
@@ -992,9 +1145,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     # -------------------- request state management --------------------
 
+    def create_omni_model_state(self, vllm_config: VllmConfig, encoder_cache: Any, device: torch.device) -> Any:
+        from .model_state import VoxCPM2ModelState
+
+        if self._enable_delayed_audio_copy:
+            raise ValueError("VoxCPM2 MRV2 uses the runner's async audio copy; disable model-side delayed_audio_copy")
+        return VoxCPM2ModelState(vllm_config, self, encoder_cache, device)
+
     def _get_or_create_state(self, request_id: str) -> _RequestState:
         state = self._active_states.get(request_id)
         if state is None:
+            if getattr(self, "_mrv2_model_state", None) is not None:
+                raise RuntimeError(f"VoxCPM2 MRV2 request {request_id} has no runner slot")
             state = _RequestState(request_id=request_id)
             self._active_states[request_id] = state
             if len(self._active_states) > self._active_state_warn_threshold and not self._active_state_warned:
@@ -1014,6 +1176,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return self._get_or_create_state(request_id)
 
     def _cleanup_request(self, request_id: str) -> None:
+        if getattr(self, "_mrv2_model_state", None) is not None:
+            # The runner owns slot release; its index may already be assigned
+            # to another request when deferred cleanup runs.
+            return
         state = self._active_states.pop(request_id, None)
         if state is not None:
             state.pending_audio_chunks_gpu.clear()
@@ -1035,16 +1201,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     def _build_prompt_cache(
         self,
-        ref_audio: Any = None,
-        prompt_audio: Any = None,
+        ref_audio: object = None,
+        prompt_audio: object = None,
         prompt_text: str | None = None,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Build prompt cache, handling both file paths and raw audio data.
 
-        The OpenAI speech API sends decoded audio as [samples_list, sr]
-        via ``_resolve_ref_audio``, while offline usage sends file paths.
+        The OpenAI speech adapter sends float32 waveform bytes with the sample
+        rate; offline usage may send a sample list or file path.
         """
         tts = self.tts
+        keep_on_device = getattr(self, "_mrv2_model_state", None) is not None
+        work_device = self._device if keep_on_device else torch.device("cpu")
 
         def _is_raw_audio(v: Any) -> bool:
             import numbers
@@ -1053,31 +1221,46 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 isinstance(v, (list, tuple))
                 and len(v) == 2
                 and isinstance(v[1], numbers.Integral)
-                and isinstance(v[0], (list, torch.Tensor))
+                and isinstance(v[0], (list, torch.Tensor, bytes))
             )
 
         if not _is_raw_audio(ref_audio) and not _is_raw_audio(prompt_audio):
-            return tts.build_prompt_cache(
+            cache = tts.build_prompt_cache(
                 prompt_text=prompt_text,
                 prompt_wav_path=prompt_audio,
                 reference_wav_path=ref_audio,
             )
+            # File-path inputs use the native helper, which returns CPU features.
+            # MRV2 prefill keeps them on GPU; raw waveform inputs below already
+            # encode on device and do not pass through this conversion.
+            if cache is not None and keep_on_device:
+                cache = {
+                    key: value.to(work_device) if isinstance(value, torch.Tensor) else value
+                    for key, value in cache.items()
+                }
+            return cache
 
         cache: dict[str, Any] = {}
         if ref_audio is not None:
             if _is_raw_audio(ref_audio):
                 samples, sr = ref_audio
-                cache["ref_audio_feat"] = _encode_raw_audio(tts, samples, sr)
+                cache["ref_audio_feat"] = _encode_raw_audio(tts, samples, sr, keep_on_device=keep_on_device)
             else:
-                cache["ref_audio_feat"] = tts._encode_wav(ref_audio, padding_mode="right")
+                cache["ref_audio_feat"] = tts._encode_wav(ref_audio, padding_mode="right").to(work_device)
 
         if prompt_audio is not None and prompt_text is not None:
             cache["prompt_text"] = prompt_text
             if _is_raw_audio(prompt_audio):
                 samples, sr = prompt_audio
-                cache["audio_feat"] = _encode_raw_audio(tts, samples, sr, padding_mode="left")
+                cache["audio_feat"] = _encode_raw_audio(
+                    tts,
+                    samples,
+                    sr,
+                    padding_mode="left",
+                    keep_on_device=keep_on_device,
+                )
             else:
-                cache["audio_feat"] = tts._encode_wav(prompt_audio, padding_mode="left")
+                cache["audio_feat"] = tts._encode_wav(prompt_audio, padding_mode="left").to(work_device)
 
         has_ref = "ref_audio_feat" in cache
         has_prompt = "audio_feat" in cache
@@ -1106,14 +1289,89 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             max_batch_size=self._max_batch_size,
         )
 
-    def _setup_torch_compile(self) -> None:
-        if not self._enable_torch_compile:
+    @staticmethod
+    def _voxcpm2_unwrap_torch_compile(module: nn.Module | Callable) -> nn.Module | Callable:
+        """Return the eager module behind torch.compile wrappers."""
+        seen: set[int] = set()
+        while hasattr(module, "_orig_mod") and id(module) not in seen:
+            seen.add(id(module))
+            module = getattr(module, "_orig_mod")
+        return module
+
+    @staticmethod
+    def _voxcpm2_compile_without_inductor_cudagraphs(
+        module: nn.Module | Callable,
+        *,
+        mode: str | None,
+        fullgraph: bool,
+    ) -> Callable:
+        """Compile VoxCPM2 LocDiT for capture inside VoxCPM2-owned CUDA graphs."""
+        kwargs: dict[str, Any] = {
+            "fullgraph": fullgraph,
+            "options": {
+                "triton.cudagraphs": False,
+                "triton.cudagraph_trees": False,
+            },
+        }
+        if mode is not None:
+            kwargs["mode"] = mode
+        return torch.compile(module, **kwargs)
+
+    @staticmethod
+    def _raise_if_cuda_runtime_error(error: BaseException) -> None:
+        if isinstance(error, torch.cuda.OutOfMemoryError):
+            raise error
+        if isinstance(error, RuntimeError):
+            message = str(error).lower()
+            cuda_markers = (
+                "cuda error",
+                "device-side assert",
+                "illegal memory access",
+                "out of memory",
+                "cublas",
+                "cudnn",
+                "cufft",
+            )
+            if any(marker in message for marker in cuda_markers):
+                raise error
+
+    def _voxcpm2_compile_unified_capture_estimator(self, module: nn.Module | Callable) -> Callable:
+        eager_module = self._voxcpm2_unwrap_torch_compile(module)
+        if getattr(self, "_estimator_for_unified_capture_source", None) is eager_module and hasattr(
+            self, "_estimator_for_unified_capture"
+        ):
+            return self._estimator_for_unified_capture
+        compiled = self._voxcpm2_compile_without_inductor_cudagraphs(
+            eager_module,
+            mode=None,
+            fullgraph=False,
+        )
+        compiled._compiled = True
+        self._estimator_for_unified_capture_source = eager_module
+        self._estimator_for_unified_capture = compiled
+        return compiled
+
+    def _voxcpm2_compile_unified_capture_feat_encoder(self, module: nn.Module | Callable) -> Callable:
+        eager_module = self._voxcpm2_unwrap_torch_compile(module)
+        if getattr(self, "_feat_encoder_for_unified_capture_source", None) is eager_module and hasattr(
+            self, "_feat_encoder_for_unified_capture"
+        ):
+            return self._feat_encoder_for_unified_capture
+        compiled = self._voxcpm2_compile_without_inductor_cudagraphs(
+            eager_module,
+            mode=None,
+            fullgraph=False,
+        )
+        compiled._compiled = True
+        self._feat_encoder_for_unified_capture_source = eager_module
+        self._feat_encoder_for_unified_capture = compiled
+        return compiled
+
+    def _setup_execution_optimizations(self) -> None:
+        if getattr(self, "_eager_optimizations_applied", False):
             return
         tts = self.tts
         estimator = tts.feat_decoder.estimator
-        if hasattr(estimator, "_compiled"):
-            return
-
         targets: list[str] = []
         cfg = self._runtime_config
 
@@ -1133,30 +1391,60 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if _install_locdit_zero_dt_cache(estimator):
                 targets.append("LocDiT zero-dt embedding cache")
 
+        # The rewrites above are regular eager PyTorch operations. Ascend does
+        # not support TorchInductor, but still benefits from fused projections
+        # and the cached delta-time embedding.
+        self._eager_optimizations_applied = True
+        if targets:
+            logger.info("VoxCPM2: eager optimizations applied to: %s", ", ".join(targets))
+        if self._enable_torch_compile:
+            self._setup_torch_compile()
+
+    def _setup_torch_compile(self) -> None:
+        tts = self.tts
+        estimator = tts.feat_decoder.estimator
+        if hasattr(estimator, "_compiled"):
+            return
+
+        targets: list[str] = []
+        cfg = self._runtime_config
+
+        external_cfm_capture = self._enable_cfm_cuda_graph or self._enable_unified_decode_graph
         if cfg.enable_loc_dit_layer_nvtx:
             patched = _install_locdit_layer_nvtx(estimator)
             if patched:
                 targets.append(f"LocDiT layer NVTX ({patched} layers, compile skipped)")
             estimator._compiled = True
-        elif self._enable_cfm_cuda_graph:
+        elif self._enable_unified_decode_graph:
+            try:
+                compiled_ro = torch.compile(estimator, mode="reduce-overhead", fullgraph=False)
+                compiled_ro._compiled = True
+                tts.feat_decoder.estimator = compiled_ro
+                targets.append("LocDiT (reduce-overhead serving + lazy no-cg unified capture)")
+            except Exception as e:
+                self._raise_if_cuda_runtime_error(e)
+                logger.warning("torch.compile LocDiT dual-mode failed: %s", e)
+                try:
+                    tts.feat_decoder.estimator = self._voxcpm2_compile_without_inductor_cudagraphs(
+                        estimator,
+                        mode="reduce-overhead",
+                        fullgraph=False,
+                    )
+                    tts.feat_decoder.estimator._compiled = True
+                    self._estimator_for_unified_capture = tts.feat_decoder.estimator
+                    targets.append("LocDiT (no-cg only, unified capture)")
+                except Exception as inner_e:
+                    self._raise_if_cuda_runtime_error(inner_e)
+                    logger.warning("torch.compile LocDiT failed completely: %s", inner_e)
+        elif external_cfm_capture:
             try:
                 if cfg.enable_loc_dit_reduce_overhead_no_cg:
-                    import torch._inductor.config as inductor_config
-
-                    old_cudagraphs = inductor_config.triton.cudagraphs
-                    old_cudagraph_trees = inductor_config.triton.cudagraph_trees
-                    inductor_config.triton.cudagraphs = False
-                    inductor_config.triton.cudagraph_trees = False
-                    try:
-                        tts.feat_decoder.estimator = torch.compile(
-                            estimator,
-                            mode="reduce-overhead",
-                            fullgraph=False,
-                        )
-                    finally:
-                        inductor_config.triton.cudagraphs = old_cudagraphs
-                        inductor_config.triton.cudagraph_trees = old_cudagraph_trees
-                    targets.append("LocDiT (reduce-overhead no-inductor-cudagraph + CUDA Graph)")
+                    tts.feat_decoder.estimator = self._voxcpm2_compile_without_inductor_cudagraphs(
+                        estimator,
+                        mode="reduce-overhead",
+                        fullgraph=False,
+                    )
+                    targets.append("LocDiT (reduce-overhead no-inductor-cudagraph + external CUDA Graph)")
                 else:
                     tts.feat_decoder.estimator = torch.compile(
                         estimator,
@@ -1166,25 +1454,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                             "triton.cudagraph_trees": False,
                         },
                     )
-                    graph_mode = "fullgraph" if cfg.enable_loc_dit_fullgraph_no_cg else "partitioned"
-                    targets.append(f"LocDiT ({graph_mode} compile no-inductor-cudagraph + CUDA Graph)")
+                    targets.append("LocDiT (no-inductor-cudagraph + external CUDA Graph)")
                 tts.feat_decoder.estimator._compiled = True
             except Exception as e:
-                logger.warning("torch.compile LocDiT reduce-overhead for CUDA Graph failed: %s", e)
-                try:
-                    tts.feat_decoder.estimator = torch.compile(
-                        estimator,
-                        fullgraph=cfg.enable_loc_dit_fullgraph_no_cg,
-                        options={
-                            "triton.cudagraphs": False,
-                            "triton.cudagraph_trees": False,
-                        },
-                    )
-                    tts.feat_decoder.estimator._compiled = True
-                    graph_mode = "fullgraph" if cfg.enable_loc_dit_fullgraph_no_cg else "partitioned"
-                    targets.append(f"LocDiT ({graph_mode} compile no-inductor-cudagraph + CUDA Graph)")
-                except Exception as inner_e:
-                    logger.warning("torch.compile LocDiT for CUDA Graph failed: %s", inner_e)
+                self._raise_if_cuda_runtime_error(e)
+                logger.warning("torch.compile LocDiT for external CUDA Graph failed: %s", e)
         else:
             try:
                 tts.feat_decoder.estimator = torch.compile(
@@ -1195,23 +1469,44 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 tts.feat_decoder.estimator._compiled = True
                 targets.append("LocDiT")
             except Exception as e:
+                self._raise_if_cuda_runtime_error(e)
                 logger.warning("torch.compile LocDiT failed: %s", e)
 
         try:
             if not hasattr(tts.feat_encoder, "_compiled"):
-                tts.feat_encoder = torch.compile(tts.feat_encoder, mode="reduce-overhead", fullgraph=False)
-                tts.feat_encoder._compiled = True
-                targets.append("feat_encoder")
+                if self._enable_unified_decode_graph:
+                    feat_encoder = tts.feat_encoder
+                    compiled_ro = torch.compile(feat_encoder, mode="reduce-overhead", fullgraph=False)
+                    compiled_ro._compiled = True
+                    tts.feat_encoder = compiled_ro
+                    targets.append("feat_encoder (reduce-overhead serving + lazy no-cg unified capture)")
+                elif external_cfm_capture:
+                    tts.feat_encoder = torch.compile(
+                        tts.feat_encoder,
+                        fullgraph=False,
+                        options={
+                            "triton.cudagraphs": False,
+                            "triton.cudagraph_trees": False,
+                        },
+                    )
+                    tts.feat_encoder._compiled = True
+                    targets.append("feat_encoder (no-inductor-cudagraph)")
+                else:
+                    tts.feat_encoder = torch.compile(tts.feat_encoder, mode="reduce-overhead", fullgraph=False)
+                    tts.feat_encoder._compiled = True
+                    targets.append("feat_encoder")
         except Exception as e:
+            self._raise_if_cuda_runtime_error(e)
             logger.warning("torch.compile feat_encoder failed: %s", e)
 
-        if self._compile_vae and not self._enable_vae_cuda_graph:
+        if self._compile_vae and not self._enable_vae_cuda_graph and not self._runtime_config.enable_incremental_vae:
             try:
                 if not hasattr(tts.audio_vae, "_compiled"):
                     tts.audio_vae.decode = torch.compile(tts.audio_vae.decode, mode="reduce-overhead", fullgraph=False)
                     tts.audio_vae._compiled = True
                     targets.append("AudioVAE")
             except Exception as e:
+                self._raise_if_cuda_runtime_error(e)
                 logger.warning("torch.compile AudioVAE failed: %s", e)
 
         if not self._enable_cuda_graph:
@@ -1220,6 +1515,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     targets.extend(f"scaffold.{t}" for t in self.model.compile_selective())
                     self.model._selective_compiled = True
                 except Exception as e:
+                    self._raise_if_cuda_runtime_error(e)
                     logger.warning("scaffold compile failed: %s", e)
 
             if not getattr(self.residual_model, "_selective_compiled", False):
@@ -1227,6 +1523,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     targets.extend(f"residual.{t}" for t in self.residual_model.compile_selective())
                     self.residual_model._selective_compiled = True
                 except Exception as e:
+                    self._raise_if_cuda_runtime_error(e)
                     logger.warning("residual compile failed: %s", e)
         else:
             self.model.precompute_fused_qkv()
@@ -1240,6 +1537,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 self._projections_compiled = True
                 targets.append("projections")
             except Exception as e:
+                self._raise_if_cuda_runtime_error(e)
                 self._compiled_dit_proj = self._compiled_stop_fn = None
                 logger.warning("projections compile failed: %s", e)
 
@@ -1255,7 +1553,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return tts.stop_head(tts.stop_actn(tts.stop_proj(lm_h)))
 
     @staticmethod
-    def _nullify_volatile_metadata(ctx: Any) -> Any:
+    def _nullify_volatile_metadata(ctx: _ForwardContextLike) -> _ForwardContextLike:
         """Set ``scheduler_metadata`` to None on all attention layers.
 
         This is the only tensor FA3 reallocates each step (variable shape).
@@ -1283,6 +1581,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         is_residual: bool = False,
     ) -> _CapturedGraph:
         """Capture a CUDA Graph for *model* at *batch_size*."""
+
         hidden_size = self.config.hidden_size
         dtype = self._side_dtype
         dev = torch.device(self._device)
@@ -1351,6 +1650,31 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             )
         return True
 
+    @staticmethod
+    def _build_unified_graph_bucket_sizes(max_size: int) -> frozenset[int]:
+        if max_size <= 0:
+            return frozenset()
+        sizes = {1}
+        size = 2
+        while size <= min(max_size, 16):
+            sizes.add(size)
+            size <<= 1
+        bucket = 24
+        while bucket <= max_size:
+            sizes.add(bucket)
+            bucket += 8
+        sizes.add(max_size)
+        return frozenset(size for size in sizes if 0 < size <= max_size)
+
+    def _select_unified_graph_bucket_size(self, batch_size: int) -> int | None:
+        if (
+            batch_size <= 0
+            or batch_size > self._unified_decode_graph_max_batch_size
+            or batch_size > self._max_cached_graphs
+        ):
+            return None
+        return min((size for size in self._unified_graph_bucket_sizes if size >= batch_size), default=None)
+
     def _capture_vae_graph(self, feat: torch.Tensor) -> _CapturedVAEGraph:
         batch_size = feat.shape[0]
         num_frames = feat.shape[-1]
@@ -1384,7 +1708,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return sr_cond
 
     def _run_vae_decode(self, feat: torch.Tensor) -> torch.Tensor:
-        if feat.device.type != current_omni_platform.device_type:
+        if feat.device.type != omni_platform.current_omni_platform.device_type:
             return self.tts.audio_vae.decode(feat)
 
         sr_cond = self._get_vae_decode_sr_cond(feat.device)
@@ -1516,8 +1840,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         with _NvtxRange("voxcpm2.cfm.graph_copy_cond"):
             graph.cond.copy_(cond)
         with _NvtxRange("voxcpm2.cfm.graph_noise"):
-            if self._deterministic_cfm_noise:
-                self._fill_deterministic_cfm_noise(state, graph.noise)
+            if self._has_deterministic_cfm_noise(state):
+                self._fill_deterministic_cfm_noise_for_state(state, graph.noise)
             else:
                 graph.noise.normal_()
         with _NvtxRange("voxcpm2.cfm.graph_replay"):
@@ -1535,7 +1859,572 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.cfm_output_gpu.copy_(graph.output)
         return state.cfm_output_gpu.transpose(1, 2)
 
+    # -------------------- unified decode graph --------------------
+
+    def _capture_unified_decode_graph(
+        self, batch_size: int, token_capacity: int | None = None, patch_batch_size: int | None = None
+    ) -> _CapturedUnifiedDecodeGraph:
+        mixed = token_capacity is not None
+        token_capacity = token_capacity if mixed else batch_size
+        patch_count = batch_size if patch_batch_size is None else patch_batch_size
+        H = self.config.hidden_size
+        D = self._feat_dim
+        P = self._patch_size
+        dev = torch.device(self._device)
+        dtype = self._side_dtype
+
+        self._setup_cfm_buffers()
+        self._setup_execution_optimizations()
+        self.model.precompute_fused_qkv()
+        self.residual_model.precompute_fused_qkv()
+
+        tts = self.tts
+        dit_hidden = tts.lm_to_dit_proj.out_features + tts.res_to_dit_proj.out_features
+        cfm_buffers = _CFMBufferManager(
+            device=dev,
+            dtype=dtype,
+            feat_dim=D,
+            patch_size=P,
+            dit_hidden_size=dit_hidden,
+            max_batch_size=max(1, patch_count),
+        )
+
+        g = _CapturedUnifiedDecodeGraph(
+            graph=torch.cuda.CUDAGraph(),
+            batch_size=batch_size,
+            input_embeds=torch.zeros(token_capacity, H, device=dev, dtype=dtype),
+            positions=torch.zeros(token_capacity, device=dev, dtype=torch.long),
+            prev_feat_embed=torch.zeros(token_capacity, H, device=dev, dtype=dtype),
+            prefix_feat_cond=torch.zeros(batch_size, P, D, device=dev, dtype=dtype),
+            next_feat_embed=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            cfm_output=torch.zeros(batch_size, D, P, device=dev, dtype=dtype),
+            lm_hidden=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            cfm_buffers=cfm_buffers,
+            cfm_noise=torch.zeros(batch_size, D, P, device=dev, dtype=dtype),
+        )
+
+        if patch_batch_size is not None:
+            g.patch_indices = torch.zeros(patch_count, device=dev, dtype=torch.long)
+        if mixed:
+            g.text_mask = torch.ones(token_capacity, 1, device=dev, dtype=dtype)
+            g.last_token_indices = torch.zeros(batch_size, device=dev, dtype=torch.long)
+        model_state = getattr(self, "_mrv2_model_state", None)
+        per_patch_audio = model_state is not None and model_state.per_patch_audio
+        if patch_batch_size is not None and (not per_patch_audio or not model_state.incremental_vae):
+            raise ValueError("Exact patch graphs require MRV2 incremental per-patch audio")
+        if per_patch_audio:
+            g.audio_slots = torch.full((batch_size,), len(model_state.slots), device=dev, dtype=torch.long)
+            g.audio_rows_valid = torch.zeros(batch_size, device=dev, dtype=torch.bool)
+        dit_proj = self._dit_proj_fn
+
+        def unified_fwd():
+            scaffold_h = self.model(input_ids=None, positions=g.positions, inputs_embeds=g.input_embeds)
+            if isinstance(scaffold_h, tuple):
+                scaffold_h = scaffold_h[0]
+            lm_h = tts.fsq_layer(scaffold_h)
+            if mixed:
+                lm_h = lm_h * (1 - g.text_mask) + scaffold_h * g.text_mask
+            res_input = tts.fusion_concat_proj(torch.cat([lm_h, g.prev_feat_embed], dim=-1))
+            res_h = self.residual_model(positions=g.positions, inputs_embeds=res_input)
+            if mixed:
+                g.scaffold_hidden = scaffold_h
+                lm_h = lm_h.index_select(0, g.last_token_indices)
+                res_h = res_h.index_select(0, g.last_token_indices)
+            output_lm_h = lm_h
+            prefix_cond = g.prefix_feat_cond
+            noise = g.cfm_noise
+            if g.patch_indices is not None:
+                if patch_count == 0:
+                    g.stop_logits = self._stop_fn(output_lm_h)
+                    g.pcm = torch.zeros(batch_size, P * int(tts.audio_vae.decode_chunk_size), device=dev)
+                    g.pcm_valid = torch.zeros(batch_size, device=dev, dtype=torch.bool)
+                    return torch.zeros_like(g.next_feat_embed), torch.zeros_like(g.cfm_output), output_lm_h
+                lm_h = lm_h.index_select(0, g.patch_indices)
+                res_h = res_h.index_select(0, g.patch_indices)
+                prefix_cond = prefix_cond.index_select(0, g.patch_indices)
+                noise = noise.index_select(0, g.patch_indices)
+            dit_h = dit_proj(lm_h, res_h)
+            cond = prefix_cond.transpose(1, 2).contiguous()
+            cfm_out = _optimized_solve_euler_with_noise(
+                tts.feat_decoder,
+                dit_h,
+                P,
+                cond,
+                noise,
+                self._inference_timesteps,
+                self._cfg_value,
+                cfm_buffers,
+                cfg_cutoff_ratio=self._cfg_cutoff_ratio,
+            )
+            feat_enc = tts.feat_encoder(cfm_out.transpose(1, 2).unsqueeze(1)).squeeze(1)
+            next_embed = tts.enc_to_lm_proj(feat_enc)
+            if per_patch_audio:
+                g.stop_logits = self._stop_fn(output_lm_h)
+                if getattr(model_state, "incremental_vae", False):
+                    slots, rows_valid, scores = g.audio_slots, g.audio_rows_valid, g.stop_logits
+                    if g.patch_indices is not None:
+                        slots = slots.index_select(0, g.patch_indices)
+                        rows_valid = rows_valid.index_select(0, g.patch_indices)
+                        scores = scores.index_select(0, g.patch_indices)
+                    pcm, valid = model_state.decode_patch(slots, rows_valid, cfm_out.transpose(1, 2))
+                    model_state.commit_patch(slots, valid, next_embed, cfm_out.transpose(1, 2), scores)
+                    if g.patch_indices is not None:
+                        g.pcm = pcm.new_zeros(batch_size, pcm.shape[1]).index_copy_(0, g.patch_indices, pcm)
+                        g.pcm_valid = valid.new_zeros(batch_size).index_copy_(0, g.patch_indices, valid)
+                    else:
+                        g.pcm, g.pcm_valid = pcm, valid
+            if g.patch_indices is not None:
+                next_embed = next_embed.new_zeros(batch_size, H).index_copy_(0, g.patch_indices, next_embed)
+                cfm_out = cfm_out.new_zeros(batch_size, D, P).index_copy_(0, g.patch_indices, cfm_out)
+            return next_embed, cfm_out, output_lm_h
+
+        ctx = get_forward_context()
+        capture_context = override_forward_context(self._nullify_volatile_metadata(ctx))
+
+        original_estimator = tts.feat_decoder.estimator
+        capture_estimator = self._voxcpm2_compile_unified_capture_estimator(original_estimator)
+        tts.feat_decoder.estimator = capture_estimator
+
+        original_feat_encoder = tts.feat_encoder
+        capture_feat_encoder = self._voxcpm2_compile_unified_capture_feat_encoder(original_feat_encoder)
+        tts.feat_encoder = capture_feat_encoder
+
+        try:
+            with capture_context:
+                with torch.no_grad():
+                    for _ in range(3):
+                        g.cfm_noise.normal_()
+                        unified_fwd()
+
+                    g.cfm_noise.normal_()
+                    with torch.cuda.graph(g.graph, pool=current_platform.get_global_graph_pool()):
+                        g.next_feat_embed, g.cfm_output, g.lm_hidden = unified_fwd()
+        finally:
+            tts.feat_decoder.estimator = original_estimator
+            tts.feat_encoder = original_feat_encoder
+        self._unified_graph_stats.captures += 1
+        if patch_batch_size is not None:
+            logger.info(
+                "Exact patch graph captured: request_bucket=%d token_bucket=%d patch_count=%d",
+                batch_size,
+                token_capacity,
+                patch_count,
+            )
+        logger.info(
+            "CUDA Graph captured for unified decode (batch_size=%d, captures=%d)",
+            batch_size,
+            self._unified_graph_stats.captures,
+        )
+        return g
+
+    def _unified_decode_graph_skip_reason(
+        self,
+        *,
+        can_use_graph: bool,
+        is_all_decode: bool,
+        num_reqs: int,
+    ) -> str | None:
+        if not self._enable_unified_decode_graph:
+            return "disabled"
+        if not can_use_graph:
+            return "graph_not_ready"
+        if not is_all_decode:
+            return "not_all_decode"
+        if num_reqs > self._unified_decode_graph_max_batch_size:
+            return "batch_exceeds_unified_max"
+        if num_reqs > self._max_cached_graphs:
+            return "batch_too_large"
+        graph_size = self._select_unified_graph_bucket_size(num_reqs)
+        if graph_size is None:
+            return "capture_policy"
+        if num_reqs > 1 and not self._runner_assisted_unified_decode_graph_active:
+            return "runner_full_metadata_missing"
+        for req_id, _, _, _ in self._pending_requests:
+            state = self._active_states[req_id]
+            if not state.prefill_completed:
+                return "prefill_incomplete"
+            if (
+                self._state_tensor(state, "prev_feat_embed") is None
+                or self._state_tensor(state, "curr_prefix_feat_cond") is None
+            ):
+                return "state_not_ready"
+        return None
+
+    def _maybe_log_unified_graph_stats(self) -> None:
+        if not self._enable_profiling:
+            return
+        stats = self._unified_graph_stats
+        total_skips = stats.total_skips
+        should_log = (stats.replays - stats.logged_replays >= 100) or (total_skips - stats.logged_skips >= 50)
+        if not should_log:
+            return
+        stats.logged_replays = stats.replays
+        stats.logged_skips = total_skips
+        logger.info(
+            "VoxCPM2 unified graph stats: captures=%d replays=%d skips=%s real_batch_sizes=%s graph_bucket_sizes=%s",
+            stats.captures,
+            stats.replays,
+            stats.skips,
+            dict(sorted(stats.real_batch_sizes.items())),
+            dict(sorted(stats.graph_bucket_sizes.items())),
+        )
+
+    def _forward_unified_decode(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        num_reqs: int,
+        batch_context: VoxCPM2BatchSlots | None = None,
+        mixed_token_capacity: int | None = None,
+    ) -> torch.Tensor:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None and model_state.per_patch_audio and model_state._pcm_copy_event is not None:
+            # The shared capture pool can alias outputs across different buckets.
+            torch.cuda.current_stream(self._device).wait_event(model_state._pcm_copy_event)
+        graph_size = self._select_unified_graph_bucket_size(num_reqs)
+        if graph_size is None:
+            raise RuntimeError(f"No unified decode graph bucket for batch size {num_reqs}")
+        exact = getattr(getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False)
+        patch_rows = (
+            [
+                i
+                for i, (req_id, is_prefill, _, _) in enumerate(self._pending_requests)
+                if patch_is_valid(self._active_states[req_id], is_prefill)
+            ]
+            if exact
+            else None
+        )
+        graph_cache = self._unified_graphs if mixed_token_capacity is None else self._mixed_graphs
+        graph_key = graph_size if mixed_token_capacity is None else (graph_size, mixed_token_capacity)
+        if exact:
+            graph_key = (
+                (graph_size, len(patch_rows))
+                if mixed_token_capacity is None
+                else (graph_size, mixed_token_capacity, len(patch_rows))
+            )
+        g = graph_cache.get(graph_key)
+        if g is None:
+            g = (
+                self._capture_unified_decode_graph(graph_size, mixed_token_capacity, len(patch_rows))
+                if exact
+                else self._capture_unified_decode_graph(graph_size, mixed_token_capacity)
+            )
+            graph_cache[graph_key] = g
+
+        self._unified_graph_stats.replays += 1
+        if self._enable_profiling:
+            self._unified_graph_stats.record_replay_batch(real_batch_size=num_reqs, graph_bucket_size=graph_size)
+        self._maybe_log_unified_graph_stats()
+        states: list[_RequestState] = []
+        # Requests already stopping must not commit another generated patch.
+        commit_mask: list[bool] = []
+        for req_id, _is_prefill, _embeds, _n in self._pending_requests:
+            state = self._active_states[req_id]
+            states.append(state)
+            already_stopping = state.is_stopping
+            commit_mask.append(patch_is_valid(state, _is_prefill))
+            if not already_stopping and not _is_prefill:
+                state.decode_step_count += 1
+                if state.decode_step_count >= self._max_decode_steps:
+                    state.is_stopping = True
+
+        self._perf.start("unified.copy_inputs")
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None:
+            slot_indices = model_state.indices_for(states, batch_context)
+        if mixed_token_capacity is not None:
+            self._prepare_mixed_graph_inputs(g, num_reqs)
+        elif model_state is not None:
+            g.prev_feat_embed[:num_reqs].copy_(model_state.next_embed.index_select(0, slot_indices))
+            g.prefix_feat_cond[:num_reqs].copy_(model_state.prefix_feat.index_select(0, slot_indices))
+        else:
+            for i, state in enumerate(states):
+                pfe = self._state_tensor(state, "prev_feat_embed")
+                g.prev_feat_embed[i].copy_(pfe.squeeze(0) if pfe.ndim > 1 else pfe)
+                pfc = self._state_tensor(state, "curr_prefix_feat_cond")
+                if pfc.ndim == 2:
+                    g.prefix_feat_cond[i].copy_(pfc)
+                else:
+                    g.prefix_feat_cond[i].copy_(pfc.squeeze(0))
+
+        num_tokens = sum(count for _, _, _, count in self._pending_requests) if mixed_token_capacity else num_reqs
+        g.input_embeds[:num_tokens].copy_(inputs_embeds[:num_tokens])
+        g.positions[:num_tokens].copy_(positions[:num_tokens])
+        if mixed_token_capacity is not None:
+            g.input_embeds[num_tokens:].zero_()
+            g.positions[num_tokens:].zero_()
+        elif graph_size > num_reqs:
+            # Runner-assisted FULL metadata pads attention to graph_size. Keep
+            # padded rows as valid duplicates instead of position-0 zero rows;
+            # some attention backends may still touch padded slots before
+            # honoring seq_lens=0.
+            last = num_reqs - 1
+            g.input_embeds[num_reqs:graph_size].copy_(g.input_embeds[last : last + 1].expand(graph_size - num_reqs, -1))
+            g.positions[num_reqs:graph_size].copy_(g.positions[last : last + 1].expand(graph_size - num_reqs))
+            g.prev_feat_embed[num_reqs:graph_size].copy_(
+                g.prev_feat_embed[last : last + 1].expand(graph_size - num_reqs, -1)
+            )
+            g.prefix_feat_cond[num_reqs:graph_size].copy_(
+                g.prefix_feat_cond[last : last + 1].expand(graph_size - num_reqs, -1, -1)
+            )
+        g.cfm_noise.normal_()
+        # Seeded rows overwrite their slice from their own generator, so the
+        # noise a seeded request sees does not depend on batch composition.
+        for i, state in enumerate(states[:num_reqs]):
+            if mixed_token_capacity is not None and self._has_deterministic_cfm_noise(state):
+                self._fill_deterministic_cfm_noise_for_state(state, g.cfm_noise[i : i + 1])
+            elif state.cfm_generator is not None:
+                g.cfm_noise[i : i + 1].normal_(generator=state.cfm_generator)
+        self._perf.stop("unified.copy_inputs")
+
+        if g.audio_slots is not None:
+            g.audio_slots[:num_reqs].copy_(slot_indices)
+            g.audio_slots[num_reqs:].fill_(len(model_state.slots))
+            host = torch.tensor(commit_mask + [False] * (graph_size - num_reqs), dtype=torch.bool, pin_memory=True)
+            g.audio_rows_valid.copy_(host, non_blocking=True)
+        if g.patch_indices is not None:
+            host_rows = torch.tensor(patch_rows, dtype=torch.long, pin_memory=True)
+            g.patch_indices.copy_(host_rows, non_blocking=True)
+        self._perf.start("unified.replay")
+        g.graph.replay()
+        self._perf.stop("unified.replay")
+
+        if g.audio_slots is not None and not getattr(model_state, "incremental_vae", False):
+            with torch.no_grad():
+                patch = g.cfm_output.transpose(1, 2)
+                g.pcm, g.pcm_valid = model_state.decode_patch(g.audio_slots, g.audio_rows_valid, patch)
+                model_state.commit_patch(g.audio_slots, g.pcm_valid, g.next_feat_embed, patch, g.stop_logits)
+
+        self._perf.start("unified.commit")
+        self._commit_graph_decode_state(
+            g, states, commit_mask, slot_indices if model_state is not None else None, batch_context
+        )
+        self._perf.stop("unified.commit")
+
+        if mixed_token_capacity is not None:
+            requests = [
+                (state, entry[1], entry[2], entry[3])
+                for state, entry in zip(states, self._pending_requests, strict=True)
+            ]
+            finish_graph_prefills(requests)
+        if g.pcm is not None:
+            self._queue_graph_pcm(g, states, commit_mask)
+            self._pending_requests.clear()
+            self._flush_deferred_cleanup()
+            return g.scaffold_hidden[:num_tokens] if mixed_token_capacity is not None else g.next_feat_embed[:num_reqs]
+        self._perf.start("unified.audio")
+        self._precompute_stop_flags_for_audio_collect(states)
+        ready_audio = self._drain_ready_audio_copies_for_states(states)
+        audio_by_req = self._collect_audio_batch(
+            states, initial_delayed_chunks_by_req=ready_audio, batch_context=batch_context
+        )
+        for state in states:
+            self._results_queue.append((state.request_id, self._state_tensor(state, "precomputed_stop_logits")))
+            self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
+
+        self._pending_requests.clear()
+        self._flush_deferred_cleanup()
+        self._perf.stop("unified.audio")
+        return g.scaffold_hidden[:num_tokens] if mixed_token_capacity is not None else g.next_feat_embed[:num_reqs]
+
+    def _commit_graph_decode_state(self, g, states, commit_mask, slot_indices, batch_context) -> None:
+        """Commit valid patches while retaining the legacy stop-logit contract."""
+        num_reqs = len(states)
+        model_state = getattr(self, "_mrv2_model_state", None)
+        with torch.no_grad():
+            all_stop_logits = (
+                g.stop_logits[:num_reqs] if g.stop_logits is not None else self._stop_fn(g.lm_hidden[:num_reqs])
+            )
+        if model_state is not None and g.pcm is not None:
+            # GPU valid/active masks own tensor commits. Host ready flags describe
+            # initialized slot data, not whether this step committed a new patch.
+            for state, committed in zip(states, commit_mask, strict=True):
+                if not committed:
+                    continue
+                state.decode_state_ready = True
+                state.stop_logits_ready = True
+        elif model_state is not None:
+            # store_decode_batch writes committed rows. Only stopping rows
+            # need their logits refreshed separately.
+            if not all(commit_mask):
+                model_state.stop_logits.index_copy_(
+                    0,
+                    slot_indices,
+                    all_stop_logits.reshape(num_reqs, -1)[:, :2].to(dtype=model_state.stop_logits.dtype),
+                )
+            committed = [i for i, should_commit in enumerate(commit_mask) if should_commit]
+            if committed:
+                if len(committed) == num_reqs:
+                    # The usual decode step commits every row in graph order.
+                    # Avoid uploading a Python row list to CUDA and waiting
+                    # for the preceding graph replay to finish.
+                    model_state.store_decode_batch(
+                        states,
+                        all_stop_logits,
+                        g.next_feat_embed[:num_reqs],
+                        g.cfm_output[:num_reqs].transpose(1, 2),
+                        batch_context,
+                    )
+                else:
+                    rows = torch.tensor(committed, device=self._device, dtype=torch.long)
+                    model_state.store_decode_batch(
+                        [states[i] for i in committed],
+                        all_stop_logits.index_select(0, rows),
+                        g.next_feat_embed.index_select(0, rows),
+                        g.cfm_output.index_select(0, rows).transpose(1, 2),
+                        batch_context,
+                    )
+            for state in states:
+                state.stop_logits_ready = True
+        else:
+            for i, state in enumerate(states):
+                stop_logits_i = all_stop_logits[i : i + 1]
+                if not commit_mask[i]:
+                    state.precomputed_stop_logits = stop_logits_i
+                    continue
+                next_embed_i = g.next_feat_embed[i : i + 1].clone()
+                cfm_out_i = g.cfm_output[i : i + 1].transpose(1, 2)
+                self._commit_decode_state(state, stop_logits_i, next_embed_i, cfm_out_i)
+
+    def _queue_graph_pcm(self, graph, states, commit_mask) -> None:
+        """Keep PCM alive until async copy and preserve original batch rows."""
+        model_state = self._mrv2_model_state
+        num_reqs = len(states)
+        # The output copy stream records this event before another replay.
+        graph.audio_copy_event = torch.cuda.Event()
+        model_state._pcm_copy_event = graph.audio_copy_event
+        model_state._step_pcm = (graph.pcm[:num_reqs], graph.pcm_valid[:num_reqs], graph.audio_copy_event)
+        for state, committed in zip(states, commit_mask, strict=True):
+            state.audio_patch_ready = False
+            logits = self._state_tensor(state, "precomputed_stop_logits") if committed else None
+            # An already-scheduled extra step may enqueue stale stop logits.
+            # GPU active_slots prevents patch commits and valid PCM output;
+            # the scheduler ignores repeated stop results for finished requests.
+            self._results_queue.append((state.request_id, logits))
+            self._audio_queue.append((state.request_id, None))
+
     # -------------------- vllm hooks --------------------
+
+    def _scheduled_patch_count(
+        self, req_ids, num_scheduled_tokens, num_computed_tokens, num_prompt_tokens
+    ) -> int | None:
+        """Predict CPU eligibility before preprocess; GPU active remains authoritative."""
+        if num_prompt_tokens is None or len(num_prompt_tokens) != len(req_ids):
+            return None
+        patch_count = 0
+        for req_id, num_scheduled_token, num_computed_token, num_prompt_token in zip(
+            req_ids, num_scheduled_tokens, num_computed_tokens, num_prompt_tokens, strict=True
+        ):
+            state = self._active_states.get(req_id)
+            if state is None:
+                return None
+            if state.is_stopping:
+                continue
+            is_prefill = int(num_computed_token) < int(num_prompt_token) or not state.prefill_completed
+            patch_count += not is_prefill or int(num_computed_token) + int(num_scheduled_token) == int(num_prompt_token)
+        return patch_count
+
+    def get_runner_assisted_full_attention_metadata_request(
+        self,
+        *,
+        req_ids: Sequence[str],
+        num_reqs: int,
+        num_scheduled_tokens: Sequence[int],
+        num_computed_tokens: Sequence[int],
+        max_num_scheduled_tokens: int,
+        num_prompt_tokens: Sequence[int] | None = None,
+    ) -> RunnerAssistedFullAttentionMetadataRequest | None:
+        if not self._enable_unified_decode_graph or not self._enable_cuda_graph:
+            return None
+        if len(req_ids) != num_reqs or len(num_computed_tokens) != num_reqs:
+            return None
+        has_prefill = any(int(n) == 0 for n in num_computed_tokens) or any(
+            not getattr(self._active_states.get(req_id), "prefill_completed", False) for req_id in req_ids
+        )
+        exact = getattr(getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False)
+        patch_count = None
+        if exact:
+            if len(num_scheduled_tokens) != num_reqs:
+                return None
+            patch_count = self._scheduled_patch_count(
+                req_ids, num_scheduled_tokens, num_computed_tokens, num_prompt_tokens
+            )
+            if patch_count is None:
+                return None
+            has_prefill |= any(
+                int(num_computed_token) < int(num_prompt_token)
+                for num_computed_token, num_prompt_token in zip(num_computed_tokens, num_prompt_tokens, strict=True)
+            )
+        if self._mixed_unified_graph_enabled() and has_prefill:
+            tts_compiled = (
+                getattr(self.tts.feat_decoder.estimator, "_compiled", False) if self._tts is not None else False
+            )
+            if not tts_compiled or self._cuda_graph_warmup_steps < self._cuda_graph_warmup_threshold:
+                return None
+            bucket = self._select_unified_graph_bucket_size(num_reqs)
+            if (
+                bucket is None
+                or num_reqs > self._unified_decode_graph_max_batch_size
+                or len(req_ids) != num_reqs
+                or len(num_scheduled_tokens) != num_reqs
+                or any(int(n) <= 0 for n in num_scheduled_tokens)
+            ):
+                return None
+            tokens = self._mixed_token_capacity(sum(int(n) for n in num_scheduled_tokens), bucket)
+            if tokens is None:
+                return None
+            key = (bucket, tokens, patch_count) if exact else (bucket, tokens)
+            if (
+                key not in self._mixed_graphs
+                and self._mixed_graph_cache_limit > 0
+                and len(self._mixed_graphs) >= self._mixed_graph_cache_limit
+            ):
+                return None
+            return RunnerAssistedFullAttentionMetadataRequest(bucket, key not in self._mixed_graphs, tokens)
+        model_state = getattr(self, "_mrv2_model_state", None)
+        per_patch_single = num_reqs == 1 and getattr(model_state, "per_patch_audio", False)
+        if (num_reqs <= 1 and not per_patch_single) or num_reqs > self._unified_decode_graph_max_batch_size:
+            return None
+        if num_reqs > self._max_cached_graphs or self._select_unified_graph_bucket_size(num_reqs) is None:
+            return None
+        if max_num_scheduled_tokens != 1 or len(num_scheduled_tokens) != num_reqs:
+            return None
+        if any(int(n) != 1 for n in num_scheduled_tokens):
+            return None
+        if len(req_ids) != num_reqs or len(num_computed_tokens) != num_reqs:
+            return None
+        if any(int(n) <= 0 for n in num_computed_tokens):
+            return None
+        tts_compiled = getattr(self.tts.feat_decoder.estimator, "_compiled", False) if self._tts is not None else False
+        if not tts_compiled or self._cuda_graph_warmup_steps < self._cuda_graph_warmup_threshold:
+            return None
+        for req_id in req_ids:
+            state = self._active_states.get(req_id)
+            if (
+                state is None
+                or not state.prefill_completed
+                or self._state_tensor(state, "prev_feat_embed") is None
+                or self._state_tensor(state, "curr_prefix_feat_cond") is None
+            ):
+                return None
+        bucket_size = self._select_unified_graph_bucket_size(num_reqs)
+        if bucket_size is None:
+            return None
+        key = (bucket_size, patch_count) if exact else bucket_size
+        return RunnerAssistedFullAttentionMetadataRequest(
+            num_reqs_padded=bucket_size,
+            for_cudagraph_capture=key not in self._unified_graphs,
+        )
+
+    def set_runner_assisted_full_attention_metadata_context(
+        self,
+        *,
+        enabled: bool,
+        num_reqs: int = 0,
+    ) -> None:
+        enabled = bool(enabled)
+        self._runner_assisted_unified_decode_graph_active = enabled
+        self._runner_assisted_unified_decode_graph_batch_size = int(num_reqs) if enabled else 0
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1552,25 +2441,89 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         dev = input_ids.device
 
         self._last_audio_output_req_ids = [req_id for req_id, _, _, _ in self._pending_requests]
+        assert len(self._last_audio_output_req_ids) == len(set(self._last_audio_output_req_ids)), (
+            "VoxCPM2 pending batch contains duplicate request IDs"
+        )
         num_reqs = len(self._pending_requests)
+        from .model_state import VoxCPM2BatchSlots
+
+        batch_slots = kwargs.get("batch_slots")
+        batch_slot_rows = kwargs.get("batch_slot_rows", {})
+        batch_context = (
+            VoxCPM2BatchSlots(batch_slots, batch_slot_rows) if isinstance(batch_slots, torch.Tensor) else None
+        )
         num_decode = sum(1 for _, is_p, _, n in self._pending_requests if not is_p and n == 1)
         is_all_decode = num_decode == num_reqs and num_reqs > 0
 
         tts_compiled = getattr(self.tts.feat_decoder.estimator, "_compiled", False) if self._tts is not None else False
         graph_ready = tts_compiled and self._cuda_graph_warmup_steps >= self._cuda_graph_warmup_threshold
-        if num_decode > 0:
+        if num_decode > 0 or (num_reqs > 0 and self._mixed_unified_graph_enabled()):
             self._cuda_graph_warmup_steps += 1
 
         can_use_graph = (
             self._enable_cuda_graph and graph_ready and intermediate_tensors is None and inputs_embeds is not None
         )
 
-        if can_use_graph and is_all_decode and num_reqs <= self._max_cached_graphs:
-            use_scaffold_graph = self._should_use_decode_graph(num_reqs)
-        else:
-            use_scaffold_graph = False
+        if (
+            self._mixed_unified_graph_enabled()
+            and any(is_prefill for _, is_prefill, _, _ in self._pending_requests)
+            and self._runner_assisted_unified_decode_graph_active
+            and can_use_graph
+            and num_reqs > 0
+            and all(
+                mixed_request_is_ready(self._active_states[req_id], is_prefill, self._mrv2_model_state.per_patch_audio)
+                for req_id, is_prefill, _, _ in self._pending_requests
+            )
+        ):
+            bucket = self._select_unified_graph_bucket_size(num_reqs)
+            capacity = (
+                self._mixed_token_capacity(sum(n for _, _, _, n in self._pending_requests), bucket)
+                if bucket is not None
+                else None
+            )
+            if capacity is not None and getattr(
+                getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False
+            ):
+                patch_count = sum(
+                    patch_is_valid(self._active_states[req_id], is_prefill)
+                    for req_id, is_prefill, _, _ in self._pending_requests
+                )
+                key = (bucket, capacity, patch_count)
+                if (
+                    key not in self._mixed_graphs
+                    and self._mixed_graph_cache_limit > 0
+                    and len(self._mixed_graphs) >= self._mixed_graph_cache_limit
+                ):
+                    capacity = None
+            if capacity is not None:
+                result = self._forward_unified_decode(inputs_embeds, positions, num_reqs, batch_context, capacity)
+                self._perf.stop("forward_total")
+                return result
 
-        if use_scaffold_graph:
+        unified_skip_reason = self._unified_decode_graph_skip_reason(
+            can_use_graph=can_use_graph,
+            is_all_decode=is_all_decode,
+            num_reqs=num_reqs,
+        )
+        if unified_skip_reason is None:
+            self._perf.start("unified_decode")
+            result = self._forward_unified_decode(inputs_embeds, positions, num_reqs, batch_context)
+            self._perf.stop("unified_decode")
+            self._perf.stop("forward_total")
+            return result
+        if self._enable_unified_decode_graph and num_reqs > 0 and unified_skip_reason is not None:
+            self._unified_graph_stats.record_skip(unified_skip_reason)
+            self._maybe_log_unified_graph_stats()
+
+        use_segmented_decode_graph = (
+            can_use_graph
+            and is_all_decode
+            and num_reqs <= self._max_cached_graphs
+            and (not self._enable_unified_decode_graph or unified_skip_reason is not None)
+            and self._should_use_decode_graph(num_reqs)
+        )
+
+        if use_segmented_decode_graph:
             self._perf.start("scaffold_fwd")
             if num_reqs not in self._scaffold_graphs:
                 self._scaffold_graphs[num_reqs] = self._capture_graph(self.model, num_reqs, "scaffold")
@@ -1590,7 +2543,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         token_offset = 0
         residual_inputs: list[torch.Tensor] = []
         residual_positions: list[torch.Tensor] = []
-        req_metas: list[tuple[_RequestState, bool, dict]] = []
+        req_metas: list[tuple[_RequestState, bool, _PrefillResidualMeta | _DecodeResidualMeta]] = []
         pending_decode_fsq: list[tuple[_RequestState, torch.Tensor, torch.Tensor]] = []
 
         def flush_decode_fsq_batch() -> None:
@@ -1605,7 +2558,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             else:
                 states = [state for state, _, _ in pending_decode_fsq]
                 hidden_list = [req_hidden for _, req_hidden, _ in pending_decode_fsq]
-                batched = self._prepare_residual_decode_batch(states, hidden_list, dev)
+                batched = self._prepare_residual_decode_batch(states, hidden_list, dev, batch_context)
                 for (state, _, req_pos), (res_input, meta) in zip(pending_decode_fsq, batched):
                     residual_inputs.append(res_input)
                     residual_positions.append(req_pos)
@@ -1619,12 +2572,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
             if is_prefill:
                 flush_decode_fsq_batch()
-                res_input, meta = self._prepare_residual_prefill(state, req_hidden, dev)
+                res_input, meta = self._prepare_residual_prefill(state, req_hidden, dev, req_pos)
             elif state.prefill_completed:
                 if (
                     self._enable_batched_fsq_fusion
                     and n == 1
-                    and state.prev_feat_embed is not None
+                    and self._state_tensor(state, "prev_feat_embed") is not None
                     and req_hidden.ndim == 2
                     and req_hidden.shape[0] == 1
                 ):
@@ -1656,6 +2609,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             residual_batch_size = batch_in.shape[0]
             use_residual_graph = (
                 self._enable_cuda_graph
+                and use_segmented_decode_graph
                 and is_all_decode
                 and graph_ready
                 and residual_batch_size == num_reqs  # 1 token per request
@@ -1679,50 +2633,70 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     batch_out = self.residual_model(batch_pos, batch_in)
             self._perf.stop("residual_fwd")
 
-            can_batch_decode_tail = (
+            can_finish_decode_batch = (
                 bool(req_metas)
                 and all(not is_prefill for _, is_prefill, _ in req_metas)
                 and all(x.shape[0] == 1 for x in residual_inputs)
             )
-            if can_batch_decode_tail:
-                self._finish_decode_batch(req_metas, batch_out)
+            if can_finish_decode_batch:
+                self._finish_decode_batch(req_metas, batch_out, batch_context)
                 self._precompute_stop_flags_for_audio_collect([state for state, _, _ in req_metas])
                 ready_audio_by_req = self._drain_ready_audio_copies_for_states([state for state, _, _ in req_metas])
                 audio_by_req = self._collect_audio_batch(
                     [state for state, _, _ in req_metas],
                     initial_delayed_chunks_by_req=ready_audio_by_req,
+                    batch_context=batch_context,
                 )
                 for state, _, _ in req_metas:
-                    self._results_queue.append((state.request_id, state.precomputed_stop_logits))
+                    self._results_queue.append((state.request_id, self._state_tensor(state, "precomputed_stop_logits")))
                     self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
             else:
                 offset = 0
                 decoded_states: list[_RequestState] = []
+                prefill_batch: list[tuple[_RequestState, _PrefillResidualMeta, torch.Tensor]] = []
                 for idx, (state, is_prefill, meta) in enumerate(req_metas):
                     n = residual_inputs[idx].shape[0]
                     res_out = batch_out[offset : offset + n]
                     offset += n
 
                     if is_prefill:
-                        self._finish_prefill(state, meta, res_out, dev)
+                        if state.is_last_prefill_chunk:
+                            prefill_batch.append((state, meta, res_out))
                     else:
-                        self._finish_decode(state, meta, res_out, dev)
+                        self._finish_decode(state, meta, res_out)
                         decoded_states.append(state)
 
-                collect_states = [state for state, _, _ in req_metas]
-                self._precompute_stop_flags_for_audio_collect(collect_states)
-                ready_audio_by_req = self._drain_ready_audio_copies_for_states(collect_states)
-                audio_by_req = self._collect_audio_batch(
-                    collect_states,
-                    initial_delayed_chunks_by_req={
-                        state.request_id: ready_audio_by_req.get(state.request_id)
-                        for state, is_prefill, _ in req_metas
-                        if not is_prefill
-                    },
-                )
+                if prefill_batch and self._runtime_config.enable_batched_prefill_tail:
+                    self._finish_prefill_batch(prefill_batch)
+                else:
+                    for state, meta, res_out in prefill_batch:
+                        self._finish_prefill(state, meta, res_out, dev)
+
+                collect_states = [
+                    state for state, is_prefill, _ in req_metas if not is_prefill or state.is_last_prefill_chunk
+                ]
+                audio_by_req: dict[str, torch.Tensor | None] = {}
+                if collect_states:
+                    self._precompute_stop_flags_for_audio_collect(collect_states)
+                    ready_audio_by_req = self._drain_ready_audio_copies_for_states(collect_states)
+                    audio_by_req = self._collect_audio_batch(
+                        collect_states,
+                        initial_delayed_chunks_by_req={
+                            state.request_id: ready_audio_by_req.get(state.request_id)
+                            for state, is_prefill, _ in req_metas
+                            if not is_prefill
+                        },
+                        batch_context=batch_context,
+                    )
                 for state, is_prefill, _ in req_metas:
-                    self._results_queue.append((state.request_id, state.precomputed_stop_logits))
-                    self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
+                    if is_prefill and not state.is_last_prefill_chunk:
+                        self._results_queue.append((state.request_id, None))
+                        self._audio_queue.append((state.request_id, None))
+                    else:
+                        self._results_queue.append(
+                            (state.request_id, self._state_tensor(state, "precomputed_stop_logits"))
+                        )
+                        self._audio_queue.append((state.request_id, audio_by_req.get(state.request_id)))
 
         self._pending_requests.clear()
         self._flush_deferred_cleanup()
@@ -1731,17 +2705,25 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     # -------------------- prefill / decode helpers --------------------
 
-    def _prepare_residual_prefill(self, state: _RequestState, base_lm_out: torch.Tensor, dev: Any):
+    def _prepare_residual_prefill(
+        self,
+        state: _RequestState,
+        base_lm_out: torch.Tensor,
+        dev: torch.device,
+        req_pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, _PrefillResidualMeta]:
         tts = self.tts
         text_mask, feat_mask, feat, feat_embed = state.prefill_masks
-        state.prefill_masks = None
-
+        text_mask = text_mask[:, req_pos]
+        feat_mask = feat_mask[:, req_pos]
+        feat = feat[:, req_pos]
+        feat_embed = feat_embed[:, req_pos]
         tts_len = text_mask.shape[1]
         scaffold_len = base_lm_out.shape[0]
         assert scaffold_len == tts_len, (
             f"voxcpm2 prefill length mismatch: scaffold_len={scaffold_len} tts_len={tts_len}; "
             "caller must pad prompt_token_ids to the full prefill length "
-            "(see serving_speech._build_voxcpm2_prompt or the offline example)."
+            "(see VoxCPM2Adapter._build_prompt or the offline example)."
         )
         enc_out = base_lm_out.unsqueeze(0)
 
@@ -1754,10 +2736,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         lm_hidden = enc_outputs[:, -1, :]
 
         residual_input = tts.fusion_concat_proj(torch.cat([enc_outputs, feat_mask.unsqueeze(-1) * feat_embed], dim=-1))
-        meta = {"lm_hidden": lm_hidden, "prefix_feat_cond": prefix_feat_cond}
+        meta = _PrefillResidualMeta(lm_hidden=lm_hidden, prefix_feat_cond=prefix_feat_cond)
         return residual_input.squeeze(0), meta
 
-    def _prepare_residual_decode(self, state: _RequestState, base_lm_out: torch.Tensor, dev: Any):
+    def _prepare_residual_decode(
+        self,
+        state: _RequestState,
+        base_lm_out: torch.Tensor,
+        dev: torch.device,
+    ) -> tuple[torch.Tensor, _DecodeResidualMeta]:
         tts = self.tts
         state.decode_step_count += 1
 
@@ -1770,18 +2757,19 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if lm_h.ndim == 1:
             lm_h = lm_h.unsqueeze(0)
 
-        prev = state.prev_feat_embed.to(self._side_dtype)
+        prev = self._state_tensor(state, "prev_feat_embed").to(self._side_dtype)
         if prev.ndim == 1:
             prev = prev.unsqueeze(0)
         res_input = tts.fusion_concat_proj(torch.cat([lm_h, prev], dim=-1))
-        return res_input, {"new_lm_hidden": lm_h}
+        return res_input, _DecodeResidualMeta(new_lm_hidden=lm_h)
 
     def _prepare_residual_decode_batch(
         self,
         states: list[_RequestState],
         base_lm_outs: list[torch.Tensor],
-        dev: Any,
-    ) -> list[tuple[torch.Tensor, dict]]:
+        dev: torch.device,
+        batch_context: VoxCPM2BatchSlots | None = None,
+    ) -> list[tuple[torch.Tensor, _DecodeResidualMeta]]:
         tts = self.tts
 
         for state in states:
@@ -1802,16 +2790,23 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             lm_h_batch = tts.fsq_layer(hidden_batch)
             if lm_h_batch.ndim == 1:
                 lm_h_batch = lm_h_batch.unsqueeze(0)
-            prev_batch = torch.cat(
-                [state.prev_feat_embed.to(dev, dtype=self._side_dtype).reshape(1, -1) for state in states],
-                dim=0,
-            )
+            model_state = getattr(self, "_mrv2_model_state", None)
+            if model_state is not None:
+                prev_batch = model_state.gather_embeddings(states, batch_context).to(dtype=self._side_dtype)
+            else:
+                prev_batch = torch.cat(
+                    [
+                        self._state_tensor(state, "prev_feat_embed").to(dev, dtype=self._side_dtype).reshape(1, -1)
+                        for state in states
+                    ],
+                    dim=0,
+                )
             res_batch = tts.fusion_concat_proj(torch.cat([lm_h_batch, prev_batch], dim=-1))
 
         return [
             (
                 res_batch[i : i + 1],
-                {"new_lm_hidden": lm_h_batch[i : i + 1]},
+                _DecodeResidualMeta(new_lm_hidden=lm_h_batch[i : i + 1]),
             )
             for i in range(len(states))
         ]
@@ -1819,7 +2814,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def _run_cfm(self, dit_h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         with _NvtxRange("voxcpm2.cfm"):
             if self._cfm_buffers is not None:
-                if self._enable_cfm_cuda_graph and dit_h.device.type == current_omni_platform.device_type:
+                if self._enable_cfm_cuda_graph and dit_h.device.type == omni_platform.current_omni_platform.device_type:
                     return self._run_cfm_cuda_graph(dit_h, cond).transpose(1, 2)
                 return _optimized_solve_euler(
                     self.tts.feat_decoder,
@@ -1843,15 +2838,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def _run_cfm_for_state(self, state: _RequestState, dit_h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         with _NvtxRange("voxcpm2.cfm"):
             if self._cfm_buffers is not None:
-                if self._enable_cfm_cuda_graph and dit_h.device.type == current_omni_platform.device_type:
-                    if self._deterministic_cfm_noise and not self._enable_cfm_prealloc_output:
+                if self._enable_cfm_cuda_graph and dit_h.device.type == omni_platform.current_omni_platform.device_type:
+                    if self._has_deterministic_cfm_noise(state) and not self._enable_cfm_prealloc_output:
                         graph = self._get_cfm_cuda_graph(dit_h, cond)
                         with _NvtxRange("voxcpm2.cfm.graph_copy_mu"):
                             graph.mu.copy_(dit_h)
                         with _NvtxRange("voxcpm2.cfm.graph_copy_cond"):
                             graph.cond.copy_(cond)
                         with _NvtxRange("voxcpm2.cfm.graph_noise"):
-                            self._fill_deterministic_cfm_noise(state, graph.noise)
+                            self._fill_deterministic_cfm_noise_for_state(state, graph.noise)
                         with _NvtxRange("voxcpm2.cfm.graph_replay"):
                             graph.graph.replay()
                         with _NvtxRange("voxcpm2.cfm.graph_output_clone"):
@@ -1859,9 +2854,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     if not self._enable_cfm_prealloc_output:
                         return self._run_cfm_cuda_graph(dit_h, cond).transpose(1, 2)
                     return self._run_cfm_cuda_graph_to_state_buffer(state, dit_h, cond)
-                if self._deterministic_cfm_noise:
+                if self._has_deterministic_cfm_noise(state):
                     noise = self._cfm_buffers.noise[: dit_h.shape[0]]
-                    self._fill_deterministic_cfm_noise(state, noise)
+                    self._fill_deterministic_cfm_noise_for_state(state, noise)
                     return _optimized_solve_euler_with_noise(
                         self.tts.feat_decoder,
                         dit_h,
@@ -1893,6 +2888,23 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 cfg_value=self._cfg_value,
             ).transpose(1, 2)
 
+    def _has_deterministic_cfm_noise(self, state: _RequestState) -> bool:
+        """Whether this request's CFM noise is drawn deterministically."""
+        return state.cfm_generator is not None or self._deterministic_cfm_noise
+
+    def _fill_deterministic_cfm_noise_for_state(self, state: _RequestState, out: torch.Tensor) -> None:
+        """Deterministically fill ``out`` for a request with deterministic noise.
+
+        A request-level seed wins: the noise stream is a pure function of the
+        seed, so identical text + seed reproduces byte-identical audio
+        regardless of batch composition or request id. The replay-only
+        ``deterministic_cfm_noise`` hash applies otherwise.
+        """
+        if state.cfm_generator is not None:
+            out.normal_(generator=state.cfm_generator)
+        else:
+            self._fill_deterministic_cfm_noise(state, out)
+
     def _fill_deterministic_cfm_noise(self, state: _RequestState, out: torch.Tensor) -> None:
         """Fill CFM noise deterministically for benchmark replay only."""
         request_key = state.request_id.split("_", 1)[0]
@@ -1906,45 +2918,140 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         out.normal_(generator=gen)
         state.cfm_noise_step += 1
 
-    def _finish_prefill(self, state: _RequestState, meta: dict, res_out: torch.Tensor, dev: Any):
+    def _finish_prefill_batch(self, batch: list[tuple[_RequestState, _PrefillResidualMeta, torch.Tensor]]) -> None:
+        if len(batch) == 1:
+            state, meta, res_out = batch[0]
+            self._finish_prefill(state, meta, res_out, None)
+            return
+
+        self._perf.start("prefill_tail_batch")
         tts = self.tts
-        lm_hidden = meta["lm_hidden"]
-        prefix_feat_cond = meta["prefix_feat_cond"]
+        self._setup_cfm_buffers()
+        self._setup_execution_optimizations()
+
+        dit_hs: list[torch.Tensor] = []
+        conds: list[torch.Tensor] = []
+        stop_logits_list: list[torch.Tensor] = []
+
+        for state, meta, res_out in batch:
+            lm_hidden = meta.lm_hidden
+            prefix_feat_cond = meta.prefix_feat_cond
+            residual_hidden = res_out[-1:, :]
+            stop_logits = tts.stop_head(tts.stop_actn(tts.stop_proj(lm_hidden))).detach()
+            dit_h = torch.cat([tts.lm_to_dit_proj(lm_hidden), tts.res_to_dit_proj(residual_hidden)], dim=-1)
+            cond = prefix_feat_cond.transpose(1, 2).contiguous()
+            dit_hs.append(dit_h)
+            conds.append(cond)
+            stop_logits_list.append(stop_logits)
+
+        batched_dit_h = torch.cat(dit_hs, dim=0)
+        batched_cond = torch.cat(conds, dim=0)
+        b = batched_dit_h.shape[0]
+
+        any_seeded = any(state.cfm_generator is not None for state, _, _ in batch)
+        if (self._deterministic_cfm_noise or any_seeded) and self._cfm_buffers is not None:
+            noise = self._cfm_buffers.noise[:b]
+            for i, (state, _, _) in enumerate(batch):
+                if self._has_deterministic_cfm_noise(state):
+                    self._fill_deterministic_cfm_noise_for_state(state, noise[i : i + 1])
+                else:
+                    noise[i : i + 1].normal_()
+        else:
+            noise = torch.randn(
+                b,
+                self._feat_dim,
+                self._patch_size,
+                device=batched_dit_h.device,
+                dtype=batched_dit_h.dtype,
+            )
+        pred_feats = _optimized_solve_euler_with_noise(
+            tts.feat_decoder,
+            batched_dit_h,
+            self._patch_size,
+            batched_cond,
+            noise,
+            self._inference_timesteps,
+            self._cfg_value,
+            self._cfm_buffers,
+            cfg_cutoff_ratio=self._cfg_cutoff_ratio,
+        ).transpose(1, 2)
+
+        with torch.no_grad():
+            curr_embeds = tts.enc_to_lm_proj(tts.feat_encoder(pred_feats.unsqueeze(1))).squeeze(1)
+
+        for i, (state, meta, res_out) in enumerate(batch):
+            pred_feat_i = pred_feats[i : i + 1]
+            curr_embed_i = curr_embeds[i : i + 1]
+            self._commit_decode_state(state, stop_logits_list[i], curr_embed_i, pred_feat_i)
+            state.decode_step_count = 0
+            state.request_start_time = time.perf_counter()
+            state.prefill_completed = True
+            state.prefill_masks = None
+            state.prefill_embeds = None
+            state.prompt_cache = None
+
+        self._perf.stop("prefill_tail_batch")
+        if self._enable_profiling:
+            logger.info("PREFILL_BATCH[%d requests] tail breakdown:\n%s", len(batch), self._perf.breakdown())
+            self._perf.reset()
+
+    def _finish_prefill(
+        self,
+        state: _RequestState,
+        meta: _PrefillResidualMeta,
+        res_out: torch.Tensor,
+        dev: torch.device | None,
+    ) -> None:
+        self._perf.start("prefill_tail")
+        tts = self.tts
+        lm_hidden = meta.lm_hidden
+        prefix_feat_cond = meta.prefix_feat_cond
         residual_hidden = res_out[-1:, :]
 
+        self._perf.start("prefill.stop_fn")
         stop_logits = tts.stop_head(tts.stop_actn(tts.stop_proj(lm_hidden))).detach()
+        self._perf.stop("prefill.stop_fn")
+        self._perf.start("prefill.dit_proj")
         dit_h = torch.cat([tts.lm_to_dit_proj(lm_hidden), tts.res_to_dit_proj(residual_hidden)], dim=-1)
+        self._perf.stop("prefill.dit_proj")
 
         self._setup_cfm_buffers()
-        if self._enable_torch_compile:
-            self._setup_torch_compile()
+        self._setup_execution_optimizations()
 
         pred_feat = self._run_cfm_for_state(state, dit_h, prefix_feat_cond.transpose(1, 2).contiguous())
 
+        self._perf.start("prefill.feat_encoder")
         with torch.no_grad():
             curr_embed = tts.enc_to_lm_proj(tts.feat_encoder(pred_feat.unsqueeze(1))).squeeze(1)
+        self._perf.stop("prefill.feat_encoder")
 
         self._commit_decode_state(state, stop_logits, curr_embed, pred_feat)
         state.decode_step_count = 0
         state.request_start_time = time.perf_counter()
         state.prefill_completed = True
+        state.prefill_embeds = None
+        state.prefill_masks = None
+        state.prompt_cache = None
+        self._perf.stop("prefill_tail")
 
         if logger.isEnabledFor(logging.DEBUG):
             # Only compute the norm (which forces a GPU->CPU sync) if we will log it.
             logger.debug("PREFILL[%s]: patch norm=%.4f", state.request_id, pred_feat.norm().item())
+        if self._enable_profiling:
+            logger.info("PREFILL[%s] tail breakdown:\n%s", state.request_id, self._perf.breakdown())
         self._perf.reset()
 
-    def _finish_decode(self, state: _RequestState, meta: dict, res_out: torch.Tensor, dev: Any):
+    def _finish_decode(self, state: _RequestState, meta: _DecodeResidualMeta, res_out: torch.Tensor) -> None:
         self._perf.start("decode_step")
         tts = self.tts
 
-        lm_h = meta["new_lm_hidden"]
+        lm_h = meta.new_lm_hidden
         res_h = res_out.unsqueeze(0) if res_out.ndim == 1 else res_out
 
         dit_proj = getattr(self, "_compiled_dit_proj", None) or self._dit_proj_fn
         stop_fn = getattr(self, "_compiled_stop_fn", None) or self._stop_fn
 
-        pfc = state.curr_prefix_feat_cond.to(self._side_dtype)
+        pfc = self._state_tensor(state, "curr_prefix_feat_cond").to(self._side_dtype)
         if pfc.ndim == 2:
             pfc = pfc.unsqueeze(0)
         cond = pfc.transpose(1, 2).contiguous()
@@ -1959,7 +3066,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if self._enable_profiling and state.decode_step_count % 20 == 0:
             logger.info("Step %d[%s]:\n%s", state.decode_step_count, state.request_id, self._perf.breakdown())
 
-    def _finish_decode_batch(self, req_metas: list[tuple], batch_out: torch.Tensor):
+    def _finish_decode_batch(
+        self,
+        req_metas: list[tuple[_RequestState, bool, _DecodeResidualMeta]],
+        batch_out: torch.Tensor,
+        batch_context: VoxCPM2BatchSlots | None = None,
+    ) -> None:
         self._perf.start("decode_step")
         tts = self.tts
 
@@ -1968,23 +3080,32 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         if self._enable_batched_cfm and not self._enable_cfm_cuda_graph:
             states = [state for state, _, _ in req_metas]
-            lm_h = torch.cat([meta["new_lm_hidden"] for _, _, meta in req_metas], dim=0)
-            pfc = torch.cat(
-                [
-                    state.curr_prefix_feat_cond.to(self._side_dtype).unsqueeze(0)
-                    if state.curr_prefix_feat_cond.ndim == 2
-                    else state.curr_prefix_feat_cond.to(self._side_dtype)
-                    for state in states
-                ],
-                dim=0,
-            )
+            lm_h = torch.cat([meta.new_lm_hidden for _, _, meta in req_metas], dim=0)
+            model_state = getattr(self, "_mrv2_model_state", None)
+            if model_state is not None:
+                indices = model_state.indices_for(states, batch_context)
+                pfc = model_state.prefix_feat.index_select(0, indices).to(self._side_dtype)
+            else:
+                pfc = torch.cat(
+                    [
+                        self._state_tensor(state, "curr_prefix_feat_cond").to(self._side_dtype).unsqueeze(0)
+                        if self._state_tensor(state, "curr_prefix_feat_cond").ndim == 2
+                        else self._state_tensor(state, "curr_prefix_feat_cond").to(self._side_dtype)
+                        for state in states
+                    ],
+                    dim=0,
+                )
             with _NvtxRange("voxcpm2.dit_proj"):
                 dit_h = dit_proj(lm_h, batch_out)
             cond = pfc.transpose(1, 2).contiguous()
-            if self._deterministic_cfm_noise and self._cfm_buffers is not None:
+            any_seeded = any(state.cfm_generator is not None for state in states)
+            if (self._deterministic_cfm_noise or any_seeded) and self._cfm_buffers is not None:
                 noise = self._cfm_buffers.noise[: dit_h.size(0)]
                 for i, state in enumerate(states):
-                    self._fill_deterministic_cfm_noise(state, noise[i : i + 1])
+                    if self._has_deterministic_cfm_noise(state):
+                        self._fill_deterministic_cfm_noise_for_state(state, noise[i : i + 1])
+                    else:
+                        noise[i : i + 1].normal_()
                 pred_feat = _optimized_solve_euler_with_noise(
                     self.tts.feat_decoder,
                     dit_h,
@@ -2004,21 +3125,24 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             with _NvtxRange("voxcpm2.stop_fn"):
                 stop_logits = stop_fn(lm_h).detach()
 
-            for i, state in enumerate(states):
-                self._commit_decode_state(
-                    state,
-                    stop_logits[i : i + 1],
-                    next_embed[i : i + 1],
-                    pred_feat[i : i + 1],
-                )
+            if model_state is not None:
+                model_state.store_decode_batch(states, stop_logits, next_embed, pred_feat, batch_context)
+            else:
+                for i, state in enumerate(states):
+                    self._commit_decode_state(
+                        state,
+                        stop_logits[i : i + 1],
+                        next_embed[i : i + 1],
+                        pred_feat[i : i + 1],
+                    )
 
             self._perf.stop("decode_step")
             return
 
         for i, (state, _, meta) in enumerate(req_metas):
-            lm_h = meta["new_lm_hidden"]
+            lm_h = meta.new_lm_hidden
             res_h = batch_out[i : i + 1]
-            pfc = state.curr_prefix_feat_cond.to(self._side_dtype)
+            pfc = self._state_tensor(state, "curr_prefix_feat_cond").to(self._side_dtype)
             if pfc.ndim == 2:
                 pfc = pfc.unsqueeze(0)
             cond = pfc.transpose(1, 2).contiguous()
@@ -2040,12 +3164,31 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         next_embed: torch.Tensor,
         pred_feat: torch.Tensor,
     ) -> None:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None:
+            model_state.store_decode_state(state, stop_logits, next_embed, pred_feat)
+            return
         state.precomputed_stop_logits = stop_logits
         state.precomputed_is_stopping = None
         state.curr_embed_for_next = next_embed.detach()
         state.prev_feat_embed = next_embed.detach()
         state.curr_prefix_feat_cond = pred_feat[0].detach()
         state.last_audio_patch_gpu = pred_feat.detach()
+
+    def _state_tensor(self, state: _RequestState, name: str) -> torch.Tensor | None:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is None:
+            # MRV1 owns tensors directly on the request object.
+            return getattr(state, name)
+        # MRV2 owns tensors in persistent slot buffers.
+        return model_state.tensor_for(state, name)
+
+    def _clear_state_tensor(self, state: _RequestState, name: str) -> None:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None:
+            model_state.clear_tensor(state, name)
+        else:
+            setattr(state, name, None)
 
     # -------------------- audio collection --------------------
 
@@ -2059,7 +3202,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     def _enqueue_delayed_audio_copy(self, state: _RequestState, audio: torch.Tensor) -> None:
         src = audio.detach().contiguous()
-        if src.device.type != current_omni_platform.device_type:
+        if src.device.type != omni_platform.current_omni_platform.device_type:
             state.pending_audio_copies.append(_PendingAudioCopy(host=src.cpu().contiguous()))
             return
 
@@ -2135,6 +3278,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return torch.cat([chunk.reshape(-1) for chunk in chunks], dim=0)
 
     def _precompute_stop_flags_for_audio_collect(self, states: list[_RequestState]) -> None:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None and model_state.per_patch_audio:
+            return
         if (
             self._audio_emit_every == 1
             and not self._enable_delayed_audio_copy
@@ -2146,14 +3292,19 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         for state in states:
             if state.is_stopping or state.precomputed_is_stopping is not None:
                 continue
-            stop_logits = state.precomputed_stop_logits
-            if stop_logits is None or stop_logits.device.type != current_omni_platform.device_type:
+            stop_logits = self._state_tensor(state, "precomputed_stop_logits")
+            if stop_logits is None or stop_logits.device.type != omni_platform.current_omni_platform.device_type:
                 continue
             pending.append((state, stop_logits))
         if not pending:
             return
 
-        stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None:
+            indices = model_state.indices_for([state for state, _ in pending])
+            stacked = model_state.stop_logits.index_select(0, indices)
+        else:
+            stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
         stop_mask = stacked[:, 1] > stacked[:, 0]
         stop_mask_cpu = stop_mask.cpu()
         for i, (state, _) in enumerate(pending):
@@ -2162,14 +3313,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if is_stopping:
                 state.is_stopping = True
 
-    @staticmethod
-    def _should_stop_from_cached_logits(state: _RequestState) -> bool:
-        if state.is_stopping:
+    def _should_stop_from_cached_logits(self, state: _RequestState) -> bool:
+        if state.is_stopping or state.audio_length_limit_reached:
             return True
         cached = state.precomputed_is_stopping
         if cached is not None:
             return cached
-        stop_logits = state.precomputed_stop_logits
+        stop_logits = self._state_tensor(state, "precomputed_stop_logits")
         if stop_logits is None:
             return False
         is_stopping = bool(stop_logits[0, 1] > stop_logits[0, 0])
@@ -2177,6 +3327,21 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if is_stopping:
             state.is_stopping = True
         return is_stopping
+
+    def _audio_length_limit_reached(
+        self,
+        num_computed_tokens: int | np.ndarray,
+        num_scheduled_tokens: int | np.ndarray,
+        max_seq_len: int | np.ndarray | None,
+    ) -> bool | np.ndarray:
+        """Whether this span plus its sampled token exhausts the request budget."""
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        max_model_len = getattr(model_config, "max_model_len", None)
+        if max_seq_len is None:
+            limit = max_model_len
+        else:
+            limit = np.minimum(max_seq_len, max_model_len) if max_model_len is not None else max_seq_len
+        return num_computed_tokens + num_scheduled_tokens + 1 >= limit if limit is not None else False
 
     def _collect_audio(
         self, state: _RequestState, initial_delayed_chunks: list[torch.Tensor] | None = None
@@ -2197,20 +3362,39 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if initial_delayed_chunks is None:
                 delayed_chunks.extend(self._drain_pending_audio_copies(state, force=False))
 
-        patch = state.last_audio_patch_gpu
+        patch = self._state_tensor(state, "last_audio_patch_gpu")
         if patch is None:
             return self._merge_audio_chunks(delayed_chunks)
-        state.last_audio_patch_gpu = None
+        self._clear_state_tensor(state, "last_audio_patch_gpu")
 
         # patch shape: (patch_size, feat_dim) or (1, patch_size, feat_dim)
         new_latent = patch.reshape(-1, self._feat_dim).to(torch.float32)
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None and model_state.per_patch_audio:
+            indices = model_state.indices_for([state])
+            pcm, valid = model_state.decode_patch(
+                indices, torch.ones(1, dtype=torch.bool, device=indices.device), new_latent.unsqueeze(0)
+            )
+            model_state.record_eager_pcm(state, pcm[0], valid[0])
+            return None
         vae_decode_every = getattr(self, "_vae_decode_every", 1)
         if vae_decode_every > 1:
             is_stopping = self._should_stop_from_cached_logits(state)
-            state.pending_vae_latents_gpu.append(new_latent.detach())
-            if not is_stopping and len(state.pending_vae_latents_gpu) < vae_decode_every:
+            model_state = getattr(self, "_mrv2_model_state", None)
+            if model_state is not None:
+                pending = model_state.append_pending_latent(state, new_latent)
+                pending_count = state.pending_vae_count
+            else:
+                state.pending_vae_latents_gpu.append(new_latent.detach())
+                pending = None
+                pending_count = len(state.pending_vae_latents_gpu)
+            if not is_stopping and pending_count < vae_decode_every:
                 return self._merge_audio_chunks(delayed_chunks)
-            new_latent = torch.cat(state.pending_vae_latents_gpu, dim=0)
+            if pending is None:
+                pending = torch.cat(state.pending_vae_latents_gpu, dim=0)
+            assert pending is not None
+            new_latent = pending
+            state.pending_vae_count = 0
             state.pending_vae_latents_gpu.clear()
 
         n_new = new_latent.shape[0]  # = patch_size (typically 4)
@@ -2218,9 +3402,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._perf.start("vae_decode")
 
         # Build VAE input: [pad_frames | new_latent]
-        if state.decode_pad is not None:
-            vae_input = torch.cat([state.decode_pad, new_latent], dim=0)
-            pad_frames = state.decode_pad.shape[0]
+        if self._state_tensor(state, "decode_pad") is not None:
+            vae_input = torch.cat([self._state_tensor(state, "decode_pad"), new_latent], dim=0)
+            pad_frames = self._state_tensor(state, "decode_pad").shape[0]
         else:
             vae_input = new_latent
             pad_frames = 0
@@ -2242,7 +3426,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # Roll the pad buffer: keep last N latent frames as context for next step.
         with _NvtxRange("voxcpm2.vae_pad_update"):
             all_latents = vae_input  # [pad + new]
-            state.decode_pad = all_latents[-self._n_decode_pad_frames :].detach()
+            model_state = getattr(self, "_mrv2_model_state", None)
+            if model_state is not None:
+                model_state.store_decode_pad(state, all_latents)
+            else:
+                state.decode_pad = all_latents[-self._n_decode_pad_frames :].detach()
 
         self._perf.stop("vae_decode")
         if self._enable_delayed_audio_copy and self._audio_emit_every == 1:
@@ -2265,19 +3453,24 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             else:
                 merged_audio = torch.cat([chunk.reshape(-1) for chunk in state.pending_audio_chunks_gpu], dim=0)
             state.pending_audio_chunks_gpu.clear()
+            if getattr(self, "_mrv2_model_state", None) is not None:
+                return merged_audio
             return merged_audio.detach().cpu().float()
         if self._coalesce_audio_d2h:
             audio_chunk = new_audio.detach()
             if self._vae_output_storage_may_be_reused():
                 audio_chunk = audio_chunk.clone()
             return audio_chunk
-        return new_audio.detach().cpu().float()
+        return new_audio if getattr(self, "_mrv2_model_state", None) is not None else new_audio.detach().cpu().float()
 
     def _can_collect_audio_batch(
         self,
         states: list[_RequestState],
         initial_delayed_chunks_by_req: dict[str, list[torch.Tensor] | None] | None,
     ) -> bool:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None and model_state.per_patch_audio:
+            return False  # Graph path owns VAE; warmup falls back per request.
         if not getattr(self, "_enable_batched_vae_decode", False):
             return False
         if self._enable_delayed_audio_copy or self._audio_emit_every > 1 or self._enable_vae_cuda_graph:
@@ -2290,6 +3483,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self,
         states: list[_RequestState],
         initial_delayed_chunks_by_req: dict[str, list[torch.Tensor] | None] | None = None,
+        batch_context: VoxCPM2BatchSlots | None = None,
     ) -> dict[str, torch.Tensor | None]:
         if not self._can_collect_audio_batch(states, initial_delayed_chunks_by_req):
             return {
@@ -2303,11 +3497,33 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             }
 
         outputs: dict[str, torch.Tensor | None] = {state.request_id: None for state in states}
+        model_state = getattr(self, "_mrv2_model_state", None)
         pending_by_shape: dict[
             tuple[torch.device, torch.dtype, int, int],
             list[tuple[_RequestState, torch.Tensor, torch.Tensor, int, int]],
         ] = {}
         vae_decode_every = getattr(self, "_vae_decode_every", 1)
+
+        if model_state is not None:
+            # Keep metadata on the host as before, but pack tensor data once
+            # per shape directly from slots and append decoded PCM in place.
+            cohorts: dict[int, list[tuple[Any, int, int]]] = {}
+            patch_states = [state for state in states if state.audio_patch_ready]
+            if vae_decode_every > 1:
+                model_state.append_pending_batch(patch_states, batch_context)
+            for state in patch_states:
+                state.audio_patch_ready = False
+                if vae_decode_every > 1:
+                    if state.pending_vae_count < vae_decode_every and not self._should_stop_from_cached_logits(state):
+                        continue
+                    n_new = state.pending_vae_count * self._patch_size
+                else:
+                    n_new = self._patch_size
+                frames = state.decode_pad_len + n_new
+                cohorts.setdefault(frames, []).append((state, state.decode_pad_len, n_new))
+            for group in cohorts.values():
+                model_state.decode_ready_slots(group, batch_context)
+            return outputs
 
         for state in states:
             patch = state.last_audio_patch_gpu
@@ -2316,19 +3532,22 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.last_audio_patch_gpu = None
 
             new_latent = patch.reshape(-1, self._feat_dim).to(torch.float32)
+            is_stopping = False
             if vae_decode_every > 1:
                 is_stopping = self._should_stop_from_cached_logits(state)
                 state.pending_vae_latents_gpu.append(new_latent.detach())
-                if not is_stopping and len(state.pending_vae_latents_gpu) < vae_decode_every:
+                pending_count = len(state.pending_vae_latents_gpu)
+                if not is_stopping and pending_count < vae_decode_every:
                     outputs[state.request_id] = None
                     continue
                 new_latent = torch.cat(state.pending_vae_latents_gpu, dim=0)
                 state.pending_vae_latents_gpu.clear()
 
             n_new = new_latent.shape[0]
-            if state.decode_pad is not None:
-                vae_input = torch.cat([state.decode_pad, new_latent], dim=0)
-                pad_frames = state.decode_pad.shape[0]
+            pad = state.decode_pad
+            if pad is not None:
+                vae_input = torch.cat([pad, new_latent], dim=0)
+                pad_frames = pad.shape[0]
             else:
                 vae_input = new_latent
                 pad_frames = 0
@@ -2374,11 +3593,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if hidden_states is None:
             return None
 
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None and hidden_states.is_cuda:
+            return model_state.build_stop_logits(hidden_states)
+
         bsz = hidden_states.shape[0]
         logits = torch.full(
             (bsz, self.config.vocab_size), float("-inf"), device=hidden_states.device, dtype=hidden_states.dtype
         )
-
         if self._results_queue:
             for i, (req_id, stop_logits) in enumerate(self._results_queue):
                 if i >= bsz:
@@ -2388,7 +3610,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     if state is not None and state.is_stopping:
                         logits[i, 0] = 0.0
                         logits[i, 1] = 1.0
-                        state.precomputed_stop_logits = None
+                        self._clear_state_tensor(state, "precomputed_stop_logits")
                         state.precomputed_is_stopping = None
                     else:
                         logits[i, 0] = stop_logits[0, 0]
@@ -2396,7 +3618,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                         if state is not None:
                             if state.precomputed_is_stopping is not None:
                                 state.is_stopping = state.precomputed_is_stopping
-                            state.precomputed_stop_logits = None
+                            self._clear_state_tensor(state, "precomputed_stop_logits")
                             state.precomputed_is_stopping = None
                 elif state and state.prefill_completed:
                     logits[i, 1] = 1.0
@@ -2412,6 +3634,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
+
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None:
+            return model_state.make_audio_output(model_outputs)
 
         mm: dict[str, Any] = {}
         if self._audio_queue:
@@ -2429,7 +3655,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     ready_req_ids = list(audio_by_req)
                     chunks = [audio_by_req[req_id].reshape(-1) for req_id in ready_req_ids]
                     if self._coalesce_audio_d2h and any(
-                        chunk.device.type == current_omni_platform.device_type for chunk in chunks
+                        chunk.device.type == omni_platform.current_omni_platform.device_type for chunk in chunks
                     ):
                         sizes = [int(chunk.numel()) for chunk in chunks]
                         merged = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
@@ -2440,7 +3666,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     mm["sr"] = [sr for _ in ready_req_ids]
                     mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
                 elif self._coalesce_audio_d2h and any(
-                    audio.device.type == current_omni_platform.device_type for audio in audio_by_req.values()
+                    audio.device.type == omni_platform.current_omni_platform.device_type
+                    for audio in audio_by_req.values()
                 ):
                     ready_req_ids = list(audio_by_req)
                     chunks = [audio_by_req[req_id].reshape(-1) for req_id in ready_req_ids]
@@ -2449,9 +3676,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     merged_cpu = merged.detach().cpu().float()
                     mm["model_outputs"] = list(merged_cpu.split(sizes))
                     mm["sr"] = [sr for _ in ready_req_ids]
+                    # Dense mode still yields a strict SUBSET of the batch when
+                    # some requests emit no audio this step (e.g. prefill
+                    # phase). Without the marker the runner indexes these
+                    # per-request lists by batch position and misroutes audio
+                    # across requests; the marker declares meta.req_id
+                    # alignment.
+                    mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
                 else:
                     mm["model_outputs"] = list(audio_by_req.values())
                     mm["sr"] = [sr for _ in audio_by_req]
+                    # Same subset hazard as the coalesce branch above.
+                    mm["meta"] = {"req_id": list(audio_by_req), "sparse_audio": ["1"]}
             elif self._uses_sparse_audio_outputs():
                 mm["model_outputs"] = []
                 mm["sr"] = []
@@ -2473,8 +3709,187 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     # -------------------- preprocess / postprocess --------------------
 
+    def preprocess_batch_mrv2(self, *, req_infos: list[dict[str, Any]], device: torch.device) -> None:
+        """MRV2 batch embeddings; each reference waveform is encoded separately."""
+        split_map = self._get_multichar_zh_split()
+        candidates: list[tuple[dict[str, Any], list[int]]] = []
+        for info in req_infos:
+            extra = info.get("additional_information")
+            data = {**extra, **info} if isinstance(extra, dict) else info
+            slot = data.get("slot_index")
+            if slot is None:
+                continue
+            state = self._mrv2_model_state.slots[slot]
+            if state.request_id != data.get("req_id") or state.prefill_embeds is not None:
+                continue
+            if state.prompt_cache is not None or any(
+                data.get(key) is not None
+                for key in ("reference_audio", "ref_audio", "prompt_audio", "voice_profile", "voice_name")
+            ):
+                continue
+            ids = data.get("text_token_ids")
+            if not ids or not ids[0]:
+                continue
+            token_ids = list(ids[0])
+            if split_map and any(token in split_map for token in token_ids):
+                # Preserve the normal prefill validation path.
+                continue
+            if token_ids[0] == self.config.bos_token_id:
+                token_ids = token_ids[1:]
+            token_ids.append(self.tts.audio_start_token)
+            candidates.append((info, token_ids))
+
+        if len(candidates) >= 2:
+            lengths = [len(tokens) for _, tokens in candidates]
+            host_tokens = torch.tensor(
+                [token for _, tokens in candidates for token in tokens],
+                dtype=torch.long,
+                pin_memory=device.type == "cuda",
+            )
+            embedded = self.model.embed_input_ids(host_tokens.to(device, non_blocking=True))
+            for (info, _), text_embed in zip(candidates, embedded.split(lengths), strict=True):
+                info["prefill_text_embed"] = text_embed
+
+        # Encode waveforms individually; batch the downstream prefill embeddings.
+        voice: list[tuple[dict[str, Any], _RequestState, list[int], object, object, str | None]] = []
+        for info in req_infos:
+            extra = info.get("additional_information")
+            data = {**extra, **info} if isinstance(extra, dict) else info
+            slot = data.get("slot_index")
+            if slot is None or data.get("voice_profile") is not None:
+                continue
+            state = self._mrv2_model_state.slots[slot]
+            if (
+                state.request_id != data.get("req_id")
+                or state.prefill_embeds is not None
+                or state.prompt_cache is not None
+            ):
+                continue
+            ref = data.get("reference_audio")
+            if ref is None:
+                ref = data.get("ref_audio")
+            prompt = data.get("prompt_audio")
+            if isinstance(ref, list):
+                ref = ref[0] if ref else None
+            if isinstance(prompt, list):
+                prompt = prompt[0] if prompt else None
+            text = data.get("prompt_text")
+            if isinstance(text, list):
+                text = text[0] if text else None
+            if ref is None and (prompt is None or text is None):
+                continue
+            voice_name = data.get("voice_name")
+            if isinstance(voice_name, list):
+                voice_name = voice_name[0] if voice_name else None
+            if voice_name:
+                key = self._speaker_cache.make_cache_key(
+                    voice_name, model_type="voxcpm2", created_at=int(data.get("voice_created_at") or 0)
+                )
+                if self._speaker_cache.get(key) is not None:
+                    # The normal per-request path reuses this cache entry and
+                    # gives it precedence over freshly supplied audio.
+                    continue
+            if any(
+                not isinstance(value, (list, tuple)) or len(value) != 2 or not isinstance(value[1], int)
+                for value in (ref, prompt if text is not None else None)
+                if value is not None
+            ):
+                continue
+            ids = data.get("text_token_ids")
+            if not ids or not ids[0]:
+                continue
+            token_ids = list(ids[0])
+            if split_map and any(token in split_map for token in token_ids):
+                continue
+            if token_ids[0] == self.config.bos_token_id:
+                token_ids = token_ids[1:]
+            voice.append((info, state, token_ids, ref, prompt, text))
+
+        if len(voice) < 2:
+            return
+        caches = [
+            self._build_prompt_cache(ref_audio=ref, prompt_audio=prompt, prompt_text=text)
+            for _, _, _, ref, prompt, text in voice
+        ]
+        prepared: list[_PrefillInputs] = []
+        for (_, state, token_ids, *_), cache in zip(voice, caches, strict=True):
+            state.prompt_cache = cache
+            try:
+                prepared.append(self._build_prefill_inputs(token_ids, device, state=state))
+            finally:
+                state.prompt_cache = None
+
+        text_lengths = [item.text_token.shape[1] for item in prepared]
+        text_embeds = self.model.embed_input_ids(torch.cat([item.text_token.reshape(-1) for item in prepared])).split(
+            text_lengths
+        )
+        feat_embeds: list[torch.Tensor | None] = [None] * len(prepared)
+        shape_groups: dict[tuple[int, ...], list[int]] = {}
+        for row, item in enumerate(prepared):
+            shape_groups.setdefault(tuple(item.audio_feat.shape[1:]), []).append(row)
+        for rows in shape_groups.values():
+            batch_feat = torch.cat([prepared[row].audio_feat for row in rows], dim=0)
+            encoded = self.tts.enc_to_lm_proj(self.tts.feat_encoder(batch_feat))
+            for i, row in enumerate(rows):
+                feat_embeds[row] = encoded[i : i + 1]
+        for (info, *_), cache, inputs, text_embed, feat_embed in zip(
+            voice, caches, prepared, text_embeds, feat_embeds, strict=True
+        ):
+            assert feat_embed is not None
+            text_mask, audio_mask = inputs.text_mask, inputs.audio_mask
+            embeds = (
+                text_mask.unsqueeze(-1) * text_embed.unsqueeze(0) + audio_mask.unsqueeze(-1) * feat_embed
+            ).squeeze(0)
+            info["prepared_prefill"] = _PreparedPrefill(
+                cache, embeds, text_mask, audio_mask, inputs.audio_feat, feat_embed
+            )
+
+    def preprocess_decode_batch_mrv2(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        model_state = self._mrv2_model_state
+        states: list[_RequestState] = []
+        rows = self._pending_batch_rows
+        if rows is None:
+            raise RuntimeError("VoxCPM2 MRv2 decode batch requires a batch row context")
+        for info in req_infos:
+            slot = info["slot_index"]
+            state = model_state.slots[slot]
+            if state.request_id != info["req_id"]:
+                raise RuntimeError(f"VoxCPM2 slot {slot} does not belong to {info['req_id']}")
+            states.append(state)
+
+        if any(state.decode_state_ready for state in states):
+            embeds = model_state.gather_embeddings(states, model_state.preprocess_batch_slots).to(
+                device=input_embeds.device, dtype=self._side_dtype
+            )
+            if not all(state.decode_state_ready for state in states):
+                ready = torch.tensor([state.decode_state_ready for state in states], device=embeds.device)
+                embeds = embeds.masked_fill(~ready[:, None], 0)
+        else:
+            embeds = input_embeds.new_zeros((len(states), self.config.hidden_size), dtype=self._side_dtype)
+
+        for state, info in zip(states, req_infos, strict=True):
+            self._pending_requests.append((state.request_id, False, None, 1))
+            rows.append(info["batch_row"])
+        empty = input_embeds.new_empty((len(states), 0))
+        return input_ids, embeds, empty, empty, [{} for _ in states]
+
+    @staticmethod
+    def _resolve_request_id(info: dict[str, Any], fallback: str = "default") -> str:
+        # MRv2 stores the scheduler identity as req_id; MRv1 injects it as
+        # request_id. Prefer the scheduler-owned field if both are present.
+        return str(info.get("req_id") or info.get("request_id") or fallback)
+
     def preprocess(
-        self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None, **info_dict: Any
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+        **info_dict: Unpack[VoxCPM2PreprocessInput],
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         additional = info_dict.get("additional_information")
         if isinstance(additional, dict):
@@ -2485,8 +3900,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         span_len = int(input_ids.shape[0])
         dev = input_ids.device
-        req_id = info_dict.get("request_id", "default")
-        is_prefill = span_len > 1
+        req_id = self._resolve_request_id(info_dict)
+        model_state = getattr(self, "_mrv2_model_state", None)
+        slot_index = info_dict.get("slot_index")
+        if model_state is not None and slot_index is None:
+            raise RuntimeError("VoxCPM2 MRv2 preprocess requires a runner slot")
+        state = model_state.slots[slot_index] if model_state is not None and slot_index is not None else None
+        if state is not None and state.request_id != req_id:
+            raise RuntimeError(f"VoxCPM2 slot {slot_index} does not belong to {req_id}")
+        is_prefill = bool(info_dict.get("_omni_is_prefill", span_len > 1))
 
         if is_prefill:
             # Do not evict state here: _pending_requests is a per-step prefix,
@@ -2508,23 +3930,55 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if token_ids and token_ids[0] == self.config.bos_token_id:
                 token_ids = token_ids[1:]
 
-            state = self._get_or_create_state(req_id)
-            state.decode_pad = None
-            state.prefill_completed = False
-            state.decode_step_count = 0
-            state.precomputed_stop_logits = None
-            state.precomputed_is_stopping = None
-            state.last_audio_patch_gpu = None
-            if not hasattr(state, "pending_audio_chunks_gpu"):
-                state.pending_audio_chunks_gpu = []
-            if not hasattr(state, "pending_audio_copies"):
-                state.pending_audio_copies = []
-            state.pending_audio_chunks_gpu.clear()
-            state.pending_audio_copies.clear()
-            state.curr_embed_for_next = None
-            state.prev_feat_embed = None
-            state.curr_prefix_feat_cond = None
-            state.is_stopping = False
+            state = state if state is not None else self._get_or_create_state(req_id)
+            num_computed_tokens = int(info_dict.get("_omni_num_computed_tokens", 0))
+            is_first_prefill_chunk = num_computed_tokens == 0
+            if is_first_prefill_chunk:
+                state.decode_pad = None
+                state.decode_pad_len = 0
+                state.pending_vae_count = 0
+                state.decode_state_ready = False
+                state.audio_patch_ready = False
+                state.stop_logits_ready = False
+                state.prefill_completed = False
+                state.is_last_prefill_chunk = False
+                state.decode_step_count = 0
+                state.precomputed_stop_logits = None
+                state.precomputed_is_stopping = None
+                state.last_audio_patch_gpu = None
+                # SamplingParams.seed reaches vLLM's own sampler but never the
+                # CFM noise draws below, so a seeded request threads its seed
+                # into a dedicated generator here (same pattern as gepard).
+                state.cfm_noise_step = 0
+                state.cfm_generator = None
+                seed = info_dict.get("_omni_seed")
+                if seed is not None:
+                    state.cfm_generator = torch.Generator(device=self._device)
+                    state.cfm_generator.manual_seed(int(seed))
+                if not hasattr(state, "pending_audio_chunks_gpu"):
+                    state.pending_audio_chunks_gpu = []
+                if not hasattr(state, "pending_audio_copies"):
+                    state.pending_audio_copies = []
+                state.pending_audio_chunks_gpu.clear()
+                state.pending_audio_copies.clear()
+                state.curr_embed_for_next = None
+                state.prev_feat_embed = None
+                state.curr_prefix_feat_cond = None
+                state.is_stopping = False
+                state.prompt_cache = None
+                state.prefill_embeds = None
+                state.prefill_masks = None
+
+            prepared_prefill = info_dict.get("prepared_prefill")
+            if prepared_prefill is not None:
+                state.prompt_cache = prepared_prefill.prompt_cache
+                state.prefill_embeds = prepared_prefill.embeds
+                state.prefill_masks = (
+                    prepared_prefill.text_mask,
+                    prepared_prefill.audio_mask,
+                    prepared_prefill.audio_feat,
+                    prepared_prefill.feat_embed,
+                )
 
             # Voice clone / continuation
             ref_audio = info_dict.get("reference_audio") or info_dict.get("ref_audio")
@@ -2541,13 +3995,21 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 voice_profile = voice_profile[0] if voice_profile else None
             requires_precomputed_cache = isinstance(voice_profile, dict)
 
-            state.prompt_cache = None
             voice_name = info_dict.get("voice_name")
             if isinstance(voice_name, list):
                 voice_name = voice_name[0] if voice_name else None
             _created_at = int(info_dict.get("voice_created_at") or 0)
 
-            if voice_name:
+            if (
+                prepared_prefill is not None
+                and voice_name
+                and state.prompt_cache.get("mode") == "reference"
+                and "ref_audio_feat" in state.prompt_cache
+            ):
+                key = self._speaker_cache.make_cache_key(voice_name, model_type="voxcpm2", created_at=_created_at)
+                self._speaker_cache.put(key, {"ref_audio_feat": state.prompt_cache["ref_audio_feat"].clone()})
+
+            if state.prompt_cache is None and voice_name:
                 _cache_key = self._speaker_cache.make_cache_key(
                     voice_name, model_type="voxcpm2", created_at=_created_at
                 )
@@ -2570,66 +4032,122 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 )
 
             if state.prompt_cache is None and (ref_audio or (prompt_audio and prompt_text)):
-                try:
-                    state.prompt_cache = self._build_prompt_cache(
-                        ref_audio=ref_audio,
-                        prompt_audio=prompt_audio,
-                        prompt_text=prompt_text,
+                state.prompt_cache = self._build_prompt_cache(
+                    ref_audio=ref_audio,
+                    prompt_audio=prompt_audio,
+                    prompt_text=prompt_text,
+                )
+                if (
+                    voice_name
+                    and state.prompt_cache is not None
+                    and state.prompt_cache.get("mode") == "reference"
+                    and "ref_audio_feat" in state.prompt_cache
+                ):
+                    _key = self._speaker_cache.make_cache_key(voice_name, model_type="voxcpm2", created_at=_created_at)
+                    cached_feat = state.prompt_cache["ref_audio_feat"]
+                    self._speaker_cache.put(
+                        _key,
+                        {
+                            "ref_audio_feat": cached_feat.clone()
+                            if getattr(self, "_mrv2_model_state", None) is not None
+                            else cached_feat.cpu()
+                        },
                     )
-                    if (
-                        voice_name
-                        and state.prompt_cache is not None
-                        and state.prompt_cache.get("mode") == "reference"
-                        and "ref_audio_feat" in state.prompt_cache
-                    ):
-                        _key = self._speaker_cache.make_cache_key(
-                            voice_name, model_type="voxcpm2", created_at=_created_at
-                        )
-                        self._speaker_cache.put(_key, {"ref_audio_feat": state.prompt_cache["ref_audio_feat"].cpu()})
-                        logger.debug("Speaker cache STORE for VoxCPM2 speaker '%s'", voice_name)
-                except Exception as e:
-                    logger.warning("build_prompt_cache failed: %s; falling back to zero-shot", e)
-                    state.prompt_cache = None
-
-            inputs = self._build_prefill_inputs(token_ids, dev, req_id)
-            tts = self.tts
-            feat_embed = tts.enc_to_lm_proj(tts.feat_encoder(inputs["audio_feat"]))
-            text_embed = self.model.embed_input_ids(inputs["text_token"].to(dev))
-            text_mask, feat_mask = inputs["text_mask"], inputs["audio_mask"]
-            embeds = (text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed).squeeze(0)
-            state.prefill_masks = (text_mask, feat_mask, inputs["audio_feat"], feat_embed)
+                    logger.debug("Speaker cache STORE for VoxCPM2 speaker '%s'", voice_name)
+            if state.prefill_embeds is None or state.prefill_masks is None:
+                inputs = self._build_prefill_inputs(token_ids, dev, state=state)
+                tts = self.tts
+                text_embed = info_dict.get("prefill_text_embed")
+                if text_embed is not None and text_embed.shape[0] == inputs.text_token.shape[1]:
+                    # Zero-shot has no audio positions: its audio embedding is
+                    # always masked out, so skip the redundant feature encoder.
+                    text_embed = text_embed.unsqueeze(0)
+                    feat_embed = torch.zeros_like(text_embed)
+                else:
+                    text_embed = self.model.embed_input_ids(inputs.text_token.to(dev))
+                    feat_embed = tts.enc_to_lm_proj(tts.feat_encoder(inputs.audio_feat))
+                text_mask, feat_mask = inputs.text_mask, inputs.audio_mask
+                embeds = (text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed).squeeze(0)
+                state.prefill_masks = (text_mask, feat_mask, inputs.audio_feat, feat_embed)
+                state.prefill_embeds = embeds
+            if model_state is not None:
+                state.prefill_chunk_start = num_computed_tokens
+            chunk_end = num_computed_tokens + span_len
+            # span_len equals num_scheduled_tokens. Agreement with
+            # _scheduled_patch_count assumes prefill_embeds.shape[0] equals the
+            # runner's num_prompt_tokens. build_voxcpm2_prompt must ensure this
+            # prerequisite, including reference-audio positions.
+            state.is_last_prefill_chunk = chunk_end == state.prefill_embeds.shape[0]
+            if chunk_end > state.prefill_embeds.shape[0]:
+                raise ValueError(
+                    "VoxCPM2 chunked prefill exceeds the constructed prompt: "
+                    f"request_id={req_id} start={num_computed_tokens} end={chunk_end} "
+                    f"prompt_len={state.prefill_embeds.shape[0]}"
+                )
+            embeds = state.prefill_embeds[num_computed_tokens:chunk_end]
         else:
-            state = self._active_states.get(req_id)
-            curr = state.curr_embed_for_next if state else None
+            state = state if state is not None else self._active_states.get(req_id)
+            curr = self._state_tensor(state, "curr_embed_for_next") if state else None
             if curr is not None:
                 embeds = curr.to(dev, dtype=self._side_dtype).reshape(1, -1)
             else:
                 embeds = torch.zeros(1, self.config.hidden_size, device=dev, dtype=self._side_dtype)
 
+        if model_state is None and state is not None:
+            # V1 samples one output token after this span. Flush before the
+            # scheduler removes a length-capped request from the next batch.
+            computed = info_dict.get("_omni_num_computed_tokens")
+            prompt_len = info_dict.get("_omni_prompt_len")
+            max_tokens = info_dict.get("_omni_max_tokens")
+            max_seq_len = (
+                int(prompt_len) + int(max_tokens) if prompt_len is not None and max_tokens is not None else None
+            )
+            state.audio_length_limit_reached = computed is not None and bool(
+                self._audio_length_limit_reached(int(computed), span_len, max_seq_len)
+            )
+
         self._pending_requests.append((req_id, is_prefill, embeds, span_len))
+        if model_state is not None:
+            if self._pending_batch_rows is None or "batch_row" not in info_dict:
+                raise RuntimeError("VoxCPM2 MRv2 preprocess requires a batch row context")
+            self._pending_batch_rows.append(info_dict["batch_row"])
         return input_ids, embeds, {}
 
-    def postprocess(self, hidden_states: torch.Tensor, **info: Any) -> dict[str, Any]:
-        req_id = info.get("request_id", self._current_request_id or "default")
+    def postprocess(self, hidden_states: torch.Tensor, **info: Unpack[VoxCPM2PostprocessInput]) -> dict[str, Any]:
+        req_id = self._resolve_request_id(info, self._current_request_id or "default")
         if self._enable_profiling:
-            state = self._active_states.get(req_id)
+            model_state = getattr(self, "_mrv2_model_state", None)
+            slot_index = info.get("slot_index")
+            state = (
+                model_state.slots[slot_index]
+                if model_state is not None and slot_index is not None
+                else self._active_states.get(req_id)
+            )
             if state and state.decode_step_count > 0:
                 logger.info(
-                    "REQUEST DONE[%s]: %d steps, %.2fs\n%s",
+                    "REQUEST DONE[%s]: %d steps, %.2fs\n%s\nUnified graph: captures=%d replays=%d skips=%s",
                     req_id,
                     state.decode_step_count,
                     time.perf_counter() - state.request_start_time,
                     self._perf.breakdown(),
+                    self._unified_graph_stats.captures,
+                    self._unified_graph_stats.replays,
+                    self._unified_graph_stats.skips,
                 )
         return {}
 
     # -------------------- build prefill inputs --------------------
 
-    def _build_prefill_inputs(self, token_ids: list[int], dev: Any, req_id: str = "default") -> dict:
+    def _build_prefill_inputs(
+        self,
+        token_ids: list[int],
+        dev: torch.device,
+        *,
+        state: _RequestState,
+    ) -> _PrefillInputs:
         tts = self.tts
         dtype = self._side_dtype
-        state = self._active_states.get(req_id)
-        cache = state.prompt_cache if state else None
+        cache = state.prompt_cache
         mode = cache.get("mode", "continuation") if cache else "zero_shot"
 
         if cache and mode in ("continuation", "ref_continuation"):
@@ -2639,52 +4157,84 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         else:
             all_ids = token_ids
 
-        text_token = torch.tensor(all_ids, dtype=torch.int32)
-        text_token = torch.cat([text_token, torch.tensor([tts.audio_start_token], dtype=torch.int32)], dim=-1)
+        work_device = dev if getattr(self, "_mrv2_model_state", None) is not None else torch.device("cpu")
+        use_async_h2d = work_device.type == "cuda"
+        text_token = torch.tensor([*all_ids, tts.audio_start_token], dtype=torch.int32, pin_memory=use_async_h2d).to(
+            work_device, non_blocking=use_async_h2d
+        )
         text_len = text_token.shape[0]
         latent_dim = tts.audio_vae.latent_dim
         ps = self._patch_size
 
         if mode in ("zero_shot", "continuation"):
-            audio_feat = cache["audio_feat"] if cache else torch.empty((0, ps, latent_dim), dtype=torch.float32)
+            audio_feat = (
+                cache["audio_feat"]
+                if cache
+                else torch.empty((0, ps, latent_dim), dtype=torch.float32, device=work_device)
+            )
             a_len = audio_feat.size(0)
-            text_token = torch.cat([text_token, torch.zeros(a_len, dtype=torch.int32)])
-            audio_feat = torch.cat([torch.zeros((text_len, ps, latent_dim), dtype=torch.float32), audio_feat])
-            text_mask = torch.cat([torch.ones(text_len, dtype=torch.int32), torch.zeros(a_len, dtype=torch.int32)])
-            audio_mask = torch.cat([torch.zeros(text_len, dtype=torch.int32), torch.ones(a_len, dtype=torch.int32)])
+            text_token = torch.cat([text_token, torch.zeros(a_len, dtype=torch.int32, device=work_device)])
+            audio_feat = torch.cat(
+                [torch.zeros((text_len, ps, latent_dim), dtype=torch.float32, device=work_device), audio_feat]
+            )
+            text_mask = torch.cat(
+                [
+                    torch.ones(text_len, dtype=torch.int32, device=work_device),
+                    torch.zeros(a_len, dtype=torch.int32, device=work_device),
+                ]
+            )
+            audio_mask = torch.cat(
+                [
+                    torch.zeros(text_len, dtype=torch.int32, device=work_device),
+                    torch.ones(a_len, dtype=torch.int32, device=work_device),
+                ]
+            )
         elif mode == "reference":
             ref = cache["ref_audio_feat"]
             rt, rf, rtm, ram = tts._make_ref_prefix(ref, text_token.device)
-            text_token = torch.cat([rt.cpu(), text_token])
-            audio_feat = torch.cat([rf.cpu(), torch.zeros((text_len, ps, latent_dim), dtype=torch.float32)])
-            text_mask = torch.cat([rtm.cpu(), torch.ones(text_len, dtype=torch.int32)])
-            audio_mask = torch.cat([ram.cpu(), torch.zeros(text_len, dtype=torch.int32)])
+            text_token = torch.cat([rt.to(work_device), text_token])
+            audio_feat = torch.cat(
+                [rf.to(work_device), torch.zeros((text_len, ps, latent_dim), dtype=torch.float32, device=work_device)]
+            )
+            text_mask = torch.cat([rtm.to(work_device), torch.ones(text_len, dtype=torch.int32, device=work_device)])
+            audio_mask = torch.cat([ram.to(work_device), torch.zeros(text_len, dtype=torch.int32, device=work_device)])
         else:  # ref_continuation
             ref = cache["ref_audio_feat"]
             prompt = cache["audio_feat"]
             p_len = prompt.size(0)
             rt, rf, rtm, ram = tts._make_ref_prefix(ref, text_token.device)
-            text_token = torch.cat([rt.cpu(), text_token, torch.zeros(p_len, dtype=torch.int32)])
-            audio_feat = torch.cat([rf.cpu(), torch.zeros((text_len, ps, latent_dim), dtype=torch.float32), prompt])
-            ones_t = torch.ones(text_len, dtype=torch.int32)
-            zeros_p = torch.zeros(p_len, dtype=torch.int32)
-            zeros_t = torch.zeros(text_len, dtype=torch.int32)
-            ones_p = torch.ones(p_len, dtype=torch.int32)
-            text_mask = torch.cat([rtm.cpu(), ones_t, zeros_p])
-            audio_mask = torch.cat([ram.cpu(), zeros_t, ones_p])
+            text_token = torch.cat(
+                [rt.to(work_device), text_token, torch.zeros(p_len, dtype=torch.int32, device=work_device)]
+            )
+            audio_feat = torch.cat(
+                [
+                    rf.to(work_device),
+                    torch.zeros((text_len, ps, latent_dim), dtype=torch.float32, device=work_device),
+                    prompt,
+                ]
+            )
+            ones_t = torch.ones(text_len, dtype=torch.int32, device=work_device)
+            zeros_p = torch.zeros(p_len, dtype=torch.int32, device=work_device)
+            zeros_t = torch.zeros(text_len, dtype=torch.int32, device=work_device)
+            ones_p = torch.ones(p_len, dtype=torch.int32, device=work_device)
+            text_mask = torch.cat([rtm.to(work_device), ones_t, zeros_p])
+            audio_mask = torch.cat([ram.to(work_device), zeros_t, ones_p])
 
-        return {
-            "text_token": text_token.unsqueeze(0).to(dev),
-            "audio_feat": audio_feat.unsqueeze(0).to(dev).to(dtype),
-            "text_mask": text_mask.unsqueeze(0).to(dev),
-            "audio_mask": audio_mask.unsqueeze(0).to(dev),
-        }
+        return _PrefillInputs(
+            text_token=text_token.unsqueeze(0).to(dev),
+            audio_feat=audio_feat.unsqueeze(0).to(dev).to(dtype),
+            text_mask=text_mask.unsqueeze(0).to(dev),
+            audio_mask=audio_mask.unsqueeze(0).to(dev),
+        )
 
     # -------------------- weight loading --------------------
 
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"base_lm.": "model."})
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self._startup_lora_applied:
+            raise ValueError("Reloading VoxCPM2 weights with a startup LoRA is unsupported; restart the server")
+
         def _base_lm_only(ws):
             for name, tensor in ws:
                 if name.startswith("base_lm."):
@@ -2699,7 +4249,54 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # them as missing from the checkpoint.
         loaded |= {name for name, _ in self.named_parameters() if name.startswith(("_tts.", "residual_model."))}
 
+        if adapter_path := self._runtime_config.startup_lora_path:
+            merged = merge_voxcpm2_lora(
+                adapter_path, base_lm=self.model, residual_lm=self.residual_model, tts=self._tts
+            )
+            self._startup_lora_applied = True
+            logger.info("Merged VoxCPM2 startup LoRA from %s into %d linear layers", adapter_path, merged)
+
         logger.info(
             "Loaded VoxCPM2 (patch=%d, feat_dim=%d, dtype=%s)", self._patch_size, self._feat_dim, self._side_dtype
         )
         return loaded
+
+    def _mixed_token_capacity(self, num_tokens: int, request_bucket: int) -> int | None:
+        limit = self.vllm_config.scheduler_config.max_num_batched_tokens
+        required = max(num_tokens, request_bucket)
+        if required > limit:
+            return None
+        return min(limit, 1 << (required - 1).bit_length())
+
+    def _mixed_unified_graph_enabled(self) -> bool:
+        return self._enable_unified_decode_graph and getattr(self, "_mrv2_model_state", None) is not None
+
+    def _prepare_mixed_graph_inputs(self, g: _CapturedUnifiedDecodeGraph, num_reqs: int) -> None:
+        """Map packed token inputs to per-request patch conditions."""
+        offset = 0
+        last_indices = []
+        g.text_mask.zero_()
+        g.prev_feat_embed.zero_()
+        g.prefix_feat_cond.zero_()
+        for row, (req_id, is_prefill, _embeds, count) in enumerate(self._pending_requests):
+            state = self._active_states[req_id]
+            if is_prefill:
+                text_mask, audio_mask, audio_feat, feat_embed = state.prefill_masks
+                start = state.prefill_chunk_start
+                end = start + count
+                text_mask = text_mask[:, start:end]
+                audio_mask = audio_mask[:, start:end]
+                feat_embed = feat_embed[:, start:end]
+                g.text_mask[offset : offset + count].copy_(text_mask.reshape(-1, 1))
+                g.prev_feat_embed[offset : offset + count].copy_(
+                    (audio_mask.unsqueeze(-1) * feat_embed).reshape(count, -1)
+                )
+                g.prefix_feat_cond[row].copy_(audio_feat[0, end - 1])
+            else:
+                g.prev_feat_embed[offset].copy_(self._state_tensor(state, "prev_feat_embed").reshape(-1))
+                g.prefix_feat_cond[row].copy_(self._state_tensor(state, "curr_prefix_feat_cond"))
+            offset += count
+            last_indices.append(offset - 1)
+        last_indices.extend([last_indices[-1]] * (g.batch_size - num_reqs))
+        host = torch.tensor(last_indices, dtype=torch.long, pin_memory=g.last_token_indices.is_cuda)
+        g.last_token_indices.copy_(host, non_blocking=True)
