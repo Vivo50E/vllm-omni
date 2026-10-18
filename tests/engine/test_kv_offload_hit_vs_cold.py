@@ -19,6 +19,7 @@ from tests.engine import kv_offload_helpers as helpers
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
 
+
 @pytest.fixture(autouse=True)
 def _batch_invariant_kernels(monkeypatch):
     """Batch composition shifts the bf16 accumulation order, which flips greedy
@@ -31,6 +32,7 @@ def _batch_invariant_kernels(monkeypatch):
     changes kernel selection for every later test in the session.
     """
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+
 
 MODEL = "Qwen/Qwen2.5-Omni-3B"
 
