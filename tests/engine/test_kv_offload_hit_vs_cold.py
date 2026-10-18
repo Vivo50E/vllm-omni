@@ -19,12 +19,18 @@ from tests.engine import kv_offload_helpers as helpers
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
 
-# Batch composition shifts the bf16 accumulation order, which flips greedy
-# decoding on a near-tie -- enough that a multi-request comparison fails with no
-# cache involved at all. vLLM's batch-invariant kernels remove that, so the
-# comparison below tests the restore rather than the scheduler. Set before any
-# engine process is spawned, since each reads it at import.
-os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+@pytest.fixture(autouse=True)
+def _batch_invariant_kernels(monkeypatch):
+    """Batch composition shifts the bf16 accumulation order, which flips greedy
+    decoding on a near-tie -- enough that a multi-request comparison fails with
+    no cache involved at all. vLLM's batch-invariant kernels remove that, so the
+    comparison below tests the restore rather than the scheduler.
+
+    Scoped rather than set at import: the engines read it when they spawn, which
+    happens inside the test, and a module-level setenv outlives this file and
+    changes kernel selection for every later test in the session.
+    """
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
 
 MODEL = "Qwen/Qwen2.5-Omni-3B"
 
