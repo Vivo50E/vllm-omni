@@ -15,8 +15,9 @@ is kept rather than pinning everything to device 0.
 import pytest
 
 from tests.engine import kv_offload_helpers as helpers
+from tests.helpers.mark import hardware_marks
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
+pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, *hardware_marks(res={"cuda": "H100"}, num_cards=2)]
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 

@@ -15,7 +15,9 @@ import tempfile
 import pytest
 import yaml
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-Omni-3B"
 

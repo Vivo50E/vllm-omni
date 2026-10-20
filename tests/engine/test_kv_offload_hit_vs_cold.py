@@ -16,8 +16,9 @@ import os
 import pytest
 
 from tests.engine import kv_offload_helpers as helpers
+from tests.helpers.mark import hardware_marks
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, pytest.mark.cuda]
+pytestmark = [pytest.mark.advanced_model, pytest.mark.omni, *hardware_marks(res={"cuda": "H100"}, num_cards=1)]
 
 
 @pytest.fixture(autouse=True)
