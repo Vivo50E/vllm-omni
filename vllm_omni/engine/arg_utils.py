@@ -69,6 +69,10 @@ def _register_omni_hf_configs() -> None:
             IndexTTS2Config,
             IndexTTS25Config,
         )
+        from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
+            LingV3TTSConfig,
+            Ming3TTSConfig,
+        )
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MingDenseConfig,
             MingMoeConfig,
@@ -88,6 +92,9 @@ def _register_omni_hf_configs() -> None:
         )
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
+        from vllm_omni.transformers_utils.configs.ming3_audio import (
+            BailingMoeV3AudioConfig,
+        )
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
@@ -106,12 +113,15 @@ def _register_omni_hf_configs() -> None:
         ("breeze", BreezeConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
+        ("ming3_tts", Ming3TTSConfig),
+        ("lingv3_tts", LingV3TTSConfig),
         ("indextts2", IndexTTS2Config),
         ("indextts2_5", IndexTTS25Config),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
         ("personaplex", PersonaPlexConfig),
+        ("bailing_moe_v3_audio", BailingMoeV3AudioConfig),
         ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
@@ -291,6 +301,7 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
@@ -530,6 +541,7 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
+            supports_pending_generation=self.supports_pending_generation,
             supports_running_prefix_cache_reset=self.supports_running_prefix_cache_reset,
             use_v2_model_runner=self.use_v2_model_runner,
             supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,
